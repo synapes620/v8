@@ -43,13 +43,34 @@ jobs:
       with:
         targets: x86_64-pc-windows-msvc
 
+    - name: Patch find_std_rlibs.py (handle empty --rustc-revision)
+      shell: powershell
+      run: |
+        # When rust_sysroot_absolute is set, rustc_revision is empty string.
+        # find_std_rlibs.py receives "--rustc-revision " (no value) and fails.
+        # Fix: make --rustc-revision optional via nargs='?'
+        $f = "C:\src\v8\build\rust\std\find_std_rlibs.py"
+        $c = Get-Content $f -Raw
+        Write-Host "Current --rustc-revision definition:"
+        Select-String -InputObject $c -Pattern "rustc.revision" | ForEach-Object { Write-Host $_.Line }
+
+        $old = "add_argument('--rustc-revision'"
+        $new = "add_argument('--rustc-revision', nargs='?', default='', const=''"
+        $c2 = $c.Replace($old, $new)
+
+        if ($c2 -eq $c) {
+          Write-Error "Pattern not found in find_std_rlibs.py — check output above"
+          exit 1
+        }
+        Set-Content $f $c2 -Encoding utf8
+        Write-Host "Patched find_std_rlibs.py"
+
     - name: Build d8
       shell: powershell
       run: |
         $ErrorActionPreference = "Stop"
         $env:DEPOT_TOOLS_WIN_TOOLCHAIN = 0
 
-        # Use system Rust — avoids building local_rustc_sysroot from scratch
         $rustSysroot = (rustc --print sysroot 2>&1).Trim() -replace '\\', '/'
         Write-Host "Rust sysroot: $rustSysroot"
 
@@ -74,7 +95,7 @@ jobs:
       shell: powershell
       run: |
         $out = "C:\src\v8\out\x64.release"
-        foreach ($f in @("siso_output", "siso.exe.INFO", ".ninja_log")) {
+        foreach ($f in @("siso_output", ".ninja_log")) {
           $p = "$out\$f"
           if (Test-Path $p) {
             Write-Host "=== $f (last 150 lines) ==="
