@@ -59,7 +59,7 @@ jobs:
         $c2 = $c.Replace($old, $new)
 
         if ($c2 -eq $c) {
-          Write-Error "Pattern not found in find_std_rlibs.py — check output above"
+          Write-Error "Pattern not found in find_std_rlibs.py - check output above"
           exit 1
         }
         Set-Content $f $c2 -Encoding utf8
