@@ -82,14 +82,24 @@ jobs:
       run: |
         $f = "C:\src\v8\build\rust\std\find_std_rlibs.py"
         $c = Get-Content $f -Raw
-        $old = "add_argument('--rustc-revision'"
-        $new = "add_argument('--rustc-revision', nargs='?', default='', const=''"
-        $c2 = $c.Replace($old, $new)
+        Write-Host "Lines mentioning rustc-revision:"
+        Select-String -InputObject $c -Pattern "rustc.revision" | ForEach-Object { Write-Host $_.Line }
+        # Try single-quote variant first, then double-quote variant
+        $old1 = "add_argument('--rustc-revision'"
+        $old2 = "add_argument(`"--rustc-revision`""
+        $new1 = "add_argument('--rustc-revision', nargs='?', default='', const=''"
+        $new2 = "add_argument(`"--rustc-revision`", nargs='?', default='', const=''"
+        $c2 = $c.Replace($old1, $new1)
+        $variant = "single-quote"
+        if ($c2 -eq $c) {
+          $c2 = $c.Replace($old2, $new2)
+          $variant = "double-quote"
+        }
         if ($c2 -ne $c) {
           Set-Content $f $c2 -Encoding utf8
-          Write-Host "Patched find_std_rlibs.py (--rustc-revision made optional)"
+          Write-Host "Patched find_std_rlibs.py ($variant variant)"
         } else {
-          Write-Host "Pattern not found - this V8 version does not need the patch"
+          Write-Host "Pattern not found in either quote style - no patch needed or manual fix required"
         }
 
     - name: Build d8
