@@ -11,13 +11,30 @@ jobs:
         git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
         "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-    - name: Fetch V8
+    - name: Get cache week key
+      id: week
+      shell: powershell
+      run: |
+        $w = [math]::Floor((Get-Date).DayOfYear / 7)
+        "value=$w" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+    - name: Cache V8 source
+      uses: actions/cache@v4
+      id: cache-v8
+      with:
+        path: C:\src
+        key: v8-src-${{ runner.os }}-w${{ steps.week.outputs.value }}
+        restore-keys: |
+          v8-src-${{ runner.os }}-
+
+    - name: Fetch V8 (no-history, skipped on cache hit)
+      if: steps.cache-v8.outputs.cache-hit != 'true'
       shell: powershell
       run: |
         $env:DEPOT_TOOLS_WIN_TOOLCHAIN = 0
-        mkdir C:\src
+        New-Item -ItemType Directory -Force -Path C:\src | Out-Null
         cd C:\src
-        fetch.bat v8
+        fetch.bat --no-history v8
 
     - name: Create SDK junction (fake 10.0.28000.0 -> real 10.0.26100.0)
       shell: powershell
@@ -46,9 +63,6 @@ jobs:
     - name: Patch find_std_rlibs.py (handle empty --rustc-revision)
       shell: powershell
       run: |
-        # When rust_sysroot_absolute is set, rustc_revision is empty string.
-        # find_std_rlibs.py receives "--rustc-revision " (no value) and fails.
-        # Fix: make --rustc-revision optional via nargs='?'
         $f = "C:\src\v8\build\rust\std\find_std_rlibs.py"
         $c = Get-Content $f -Raw
         Write-Host "Current --rustc-revision definition:"
