@@ -36,7 +36,8 @@ jobs:
         cd C:\src
         fetch.bat --no-history v8
 
-    - name: Create SDK junction (fake 10.0.28000.0 -> real 10.0.26100.0)
+    - name: Detect Windows SDK version
+      id: sdk
       shell: powershell
       run: |
         $sdkRoot = "C:\Program Files (x86)\Windows Kits\10"
@@ -45,15 +46,7 @@ jobs:
           Sort-Object Name -Descending |
           Select-Object -First 1).Name
         Write-Host "Available SDK: $avail"
-        $fake = "10.0.28000.0"
-        foreach ($sub in @('Include', 'Lib', 'bin')) {
-          $src = "$sdkRoot\$sub\$avail"
-          $dst = "$sdkRoot\$sub\$fake"
-          if ((Test-Path $src) -and !(Test-Path $dst)) {
-            New-Item -ItemType Junction -Path $dst -Target $src -Force | Out-Null
-            Write-Host "Junction: $sub\$fake -> $sub\$avail"
-          }
-        }
+        "version=$avail" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
     - name: Setup Rust nightly
       uses: dtolnay/rust-toolchain@nightly
@@ -98,11 +91,15 @@ jobs:
         $outDir = "C:\src\v8\out\x64.release"
         New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
+        $sdkVer = "${{ steps.sdk.outputs.version }}"
+        Write-Host "Using Windows SDK: $sdkVer"
+
         $l1 = 'is_debug = false'
         $l2 = 'target_cpu = "x64"'
         $l3 = 'rust_sysroot_absolute = "' + $rustSysroot + '"'
         $l4 = 'v8_enable_memory_corruption_api = true'
-        "$l1`n$l2`n$l3`n$l4" | Set-Content -Path "$outDir\args.gn" -Encoding ascii
+        $l5 = 'win_sdk_version = "' + $sdkVer + '"'
+        "$l1`n$l2`n$l3`n$l4`n$l5" | Set-Content -Path "$outDir\args.gn" -Encoding ascii
 
         Write-Host "=== args.gn ==="
         Get-Content "$outDir\args.gn"
