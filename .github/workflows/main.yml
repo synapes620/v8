@@ -35,18 +35,19 @@ jobs:
         New-Item -ItemType Directory -Force -Path C:\src | Out-Null
         Set-Location C:\src
         # Write .gclient directly (gclient config --spec passes through cmd.exe which
-        # strips all double-quotes, producing invalid Python and "syntax error in .gclient")
-        $gclientContent = @"
-solutions = [
-  {
-    "name": "v8",
-    "url": "https://chromium.googlesource.com/v8/v8.git",
-    "deps_file": "DEPS",
-    "custom_deps": {},
-  }
-]
-"@
-        Set-Content -Path "C:\src\.gclient" -Value $gclientContent -Encoding ascii
+        # strips all double-quotes, producing invalid Python and "syntax error in .gclient").
+        # Use an array -join instead of a PowerShell @"..."@ heredoc because heredoc
+        # requires the closing "@ at column 0, which YAML block scalar indent rules forbid.
+        @(
+          'solutions = [',
+          '  {',
+          '    "name": "v8",',
+          '    "url": "https://chromium.googlesource.com/v8/v8.git",',
+          '    "deps_file": "DEPS",',
+          '    "custom_deps": {},',
+          '  }',
+          ']'
+        ) -join "`n" | Set-Content "C:\src\.gclient" -Encoding ascii -NoNewline
         Write-Host "=== .gclient written ==="
         Get-Content "C:\src\.gclient"
         # --jobs 4 to prevent the gsutil lock race (error code 6) on cache miss
