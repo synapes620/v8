@@ -107,7 +107,8 @@ jobs:
         $l1 = 'is_debug = false'
         $l2 = 'target_cpu = "x64"'
         $l3 = 'rust_sysroot_absolute = "' + $rustSysroot + '"'
-        "$l1`n$l2`n$l3" | Set-Content -Path "$outDir\args.gn" -Encoding ascii
+        $l4 = 'v8_enable_memory_corruption_api = true'
+        "$l1`n$l2`n$l3`n$l4" | Set-Content -Path "$outDir\args.gn" -Encoding ascii
 
         Write-Host "=== args.gn ==="
         Get-Content "$outDir\args.gn"
