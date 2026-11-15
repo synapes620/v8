@@ -60,6 +60,23 @@ jobs:
       with:
         targets: x86_64-pc-windows-msvc
 
+    - name: Patch sandbox testing for Windows (remove Linux-only crash filter restriction)
+      shell: powershell
+      run: |
+        $f = "C:\src\v8\src\sandbox\testing.cc"
+        $c = Get-Content $f -Raw
+        Write-Host "Lines mentioning Linux in testing.cc:"
+        Select-String -InputObject $c -Pattern "Linux" | ForEach-Object { Write-Host $_.Line }
+        $old = 'FATAL("The sandbox crash filter is currently only available on Linux");'
+        $new = '// Sandbox crash filter not supported on Windows - skip'
+        $c2 = $c.Replace($old, $new)
+        if ($c2 -ne $c) {
+          Set-Content $f $c2 -Encoding utf8
+          Write-Host "Patched sandbox testing.cc"
+        } else {
+          Write-Host "Pattern not found - check lines above for exact string"
+        }
+
     - name: Patch find_std_rlibs.py (handle empty --rustc-revision)
       shell: powershell
       run: |
