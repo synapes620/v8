@@ -1,0 +1,89 @@
+name: Build V8 d8
+on: [workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+    - name: Setup depot_tools
+      shell: powershell
+      run: |
+        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+        "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Fetch V8
+      shell: powershell
+      run: |
+        $env:DEPOT_TOOLS_WIN_TOOLCHAIN = 0
+        mkdir C:\src
+        cd C:\src
+        fetch.bat v8
+
+    - name: Create SDK junction (fake 10.0.28000.0 -> real 10.0.26100.0)
+      shell: powershell
+      run: |
+        $sdkRoot = "C:\Program Files (x86)\Windows Kits\10"
+        $avail = (Get-ChildItem "$sdkRoot\Include" |
+          Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+          Sort-Object Name -Descending |
+          Select-Object -First 1).Name
+        Write-Host "Available SDK: $avail"
+        $fake = "10.0.28000.0"
+        foreach ($sub in @('Include', 'Lib', 'bin')) {
+          $src = "$sdkRoot\$sub\$avail"
+          $dst = "$sdkRoot\$sub\$fake"
+          if ((Test-Path $src) -and !(Test-Path $dst)) {
+            New-Item -ItemType Junction -Path $dst -Target $src -Force | Out-Null
+            Write-Host "Junction: $sub\$fake -> $sub\$avail"
+          }
+        }
+
+    - name: Setup Rust stable
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-msvc
+
+    - name: Build d8
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+        $env:DEPOT_TOOLS_WIN_TOOLCHAIN = 0
+
+        # Use system Rust — avoids building local_rustc_sysroot from scratch
+        $rustSysroot = (rustc --print sysroot 2>&1).Trim() -replace '\\', '/'
+        Write-Host "Rust sysroot: $rustSysroot"
+
+        $outDir = "C:\src\v8\out\x64.release"
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+        $l1 = 'is_debug = false'
+        $l2 = 'target_cpu = "x64"'
+        $l3 = 'rust_sysroot_absolute = "' + $rustSysroot + '"'
+        "$l1`n$l2`n$l3" | Set-Content -Path "$outDir\args.gn" -Encoding ascii
+
+        Write-Host "=== args.gn ==="
+        Get-Content "$outDir\args.gn"
+
+        cd C:\src\v8
+        gn.bat gen $outDir
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        ninja.bat -C $outDir d8
+
+    - name: Show build errors
+      if: failure()
+      shell: powershell
+      run: |
+        $out = "C:\src\v8\out\x64.release"
+        foreach ($f in @("siso_output", "siso.exe.INFO", ".ninja_log")) {
+          $p = "$out\$f"
+          if (Test-Path $p) {
+            Write-Host "=== $f (last 150 lines) ==="
+            Get-Content $p -Tail 150
+          }
+        }
+
+    - name: Upload d8
+      uses: actions/upload-artifact@v4
+      with:
+        name: d8-win-x64
+        path: C:\src\v8\out\x64.release\d8.exe
