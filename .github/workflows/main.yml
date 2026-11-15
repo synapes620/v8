@@ -81,27 +81,9 @@ jobs:
       shell: powershell
       run: |
         $f = "C:\src\v8\build\rust\std\find_std_rlibs.py"
-        # Write a Python patcher script to avoid PowerShell quote escaping issues
-        $patcher = @'
-import re, sys
-f = sys.argv[1]
-with open(f, encoding='utf-8') as fp:
-    c = fp.read()
-for i, line in enumerate(c.splitlines(), 1):
-    if 'rustc' in line and 'revision' in line:
-        print(f"Line {i}: {repr(line)}")
-# Match add_argument with either single or double quotes around --rustc-revision
-pattern = r"""add_argument\(['"]{1,2}--rustc-revision['"]{1,2}"""
-replacement = "add_argument('--rustc-revision', nargs='?', default='', const=''"
-new = re.sub(pattern, replacement, c)
-if new != c:
-    with open(f, 'w', encoding='utf-8') as fp:
-        fp.write(new)
-    print("Patched find_std_rlibs.py")
-else:
-    print("Pattern not found - no patch needed")
-'@
-        $patcher | Set-Content "C:\patch_rlibs.py" -Encoding utf8
+        # Base64-encoded Python patcher (avoids YAML/PowerShell quote escaping issues)
+        $b64 = "aW1wb3J0IHJlLCBzeXMKZiA9IHN5cy5hcmd2WzFdCndpdGggb3BlbihmLCBlbmNvZGluZz0ndXRmLTgnKSBhcyBmcDoKICAgIGMgPSBmcC5yZWFkKCkKZm9yIGksIGxpbmUgaW4gZW51bWVyYXRlKGMuc3BsaXRsaW5lcygpLCAxKToKICAgIGlmICdydXN0YycgaW4gbGluZSBhbmQgJ3JldmlzaW9uJyBpbiBsaW5lOgogICAgICAgIHByaW50KCdMaW5lICVkOiAlcycgJSAoaSwgcmVwcihsaW5lKSkpCnBhdHRlcm4gPSByImFkZF9hcmd1bWVudFwoWydcIl0tLXJ1c3RjLXJldmlzaW9uWydcIl0iCnJlcGxhY2VtZW50ID0gImFkZF9hcmd1bWVudCgnLS1ydXN0Yy1yZXZpc2lvbicsIG5hcmdzPSc/JywgZGVmYXVsdD0nJywgY29uc3Q9JycpIgpuZXcgPSByZS5zdWIocGF0dGVybiwgcmVwbGFjZW1lbnQsIGMpCmlmIG5ldyAhPSBjOgogICAgd2l0aCBvcGVuKGYsICd3JywgZW5jb2Rpbmc9J3V0Zi04JykgYXMgZnA6CiAgICAgICAgZnAud3JpdGUobmV3KQogICAgcHJpbnQoJ1BhdGNoZWQgZmluZF9zdGRfcmxpYnMucHknKQplbHNlOgogICAgcHJpbnQoJ1BhdHRlcm4gbm90IGZvdW5kIC0gbm8gcGF0Y2ggbmVlZGVkJykK"
+        python3 -I -c "import base64,sys; open('C:/patch_rlibs.py','w').write(base64.b64decode('$b64').decode())"
         python3 -I "C:\patch_rlibs.py" "$f"
 
     - name: Build d8
