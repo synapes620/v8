@@ -75,27 +75,40 @@ jobs:
     - name: Patch Windows SDK headers (inject missing minwinbase.h include)
       shell: powershell
       run: |
-        # SDK 10.0.26100.0: fileapi.h(1081) and winbase.h use FILE_INFO_BY_HANDLE_CLASS
-        # but that type lives in minwinbase.h which is not always transitively included.
-        # Clang-cl is stricter than MSVC about header ordering; patch both files.
+        # Error chain: windows.h:176 -> winbase.h:43 -> fileapifromapp.h:20 -> fileapi.h:1081
+        # fileapi.h uses FILE_INFO_BY_HANDLE_CLASS which is defined in minwinbase.h,
+        # but minwinbase.h hasn't been included yet at that point in the chain.
+        # Fix: patch fileapifromapp.h to include minwinbase.h before it includes fileapi.h.
         $sdkInc = "C:\Program Files (x86)\Windows Kits\10\include\10.0.28000.0\um"
-        foreach ($name in @("fileapi.h", "winbase.h")) {
-          $f = "$sdkInc\$name"
-          if (!(Test-Path $f)) { Write-Host "Not found: $f"; continue }
-          $raw = [System.IO.File]::ReadAllBytes($f)
-          $c = [System.Text.Encoding]::UTF8.GetString($raw)
-          if ($c -match '#include\s*[<"]minwinbase\.h[>"]') {
-            Write-Host "$name`: already includes minwinbase.h - skipping"
-            continue
-          }
-          # Insert right after the first #pragma once (keep existing line endings)
-          $patched = $c -replace '(#pragma once[^\r\n]*[\r\n]+)', ('$1#include <minwinbase.h>'+"`r`n")
-          if ($patched -eq $c) {
-            # No pragma once found - prepend
+        Write-Host "=== SDK dir contents (first 5 files) ==="
+        if (Test-Path $sdkInc) {
+          Get-ChildItem $sdkInc | Select-Object -First 5 | ForEach-Object { Write-Host $_.Name }
+        } else {
+          Write-Host "DIR NOT FOUND: $sdkInc"
+        }
+        # Patch fileapifromapp.h: add #include <minwinbase.h> right before #include <fileapi.h>
+        $target = "fileapifromapp.h"
+        $f = "$sdkInc\$target"
+        if (!(Test-Path $f)) {
+          Write-Host "NOT FOUND: $f - trying 10.0.26100.0 directly"
+          $sdkInc = "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um"
+          $f = "$sdkInc\$target"
+        }
+        if (Test-Path $f) {
+          $c = [System.IO.File]::ReadAllText($f)
+          Write-Host "=== $target first 5 lines ==="
+          ($c -split '\r?\n' | Select-Object -First 5) | ForEach-Object { Write-Host $_ }
+          if ($c -match 'minwinbase') {
+            Write-Host "$target already has minwinbase - skipping"
+          } else {
+            # Prepend include at top of file (before any guards) - most reliable
             $patched = "#include <minwinbase.h>`r`n" + $c
+            [System.IO.File]::WriteAllText($f, $patched)
+            Write-Host "Patched: $target"
+            Write-Host "Verify first line: $(([System.IO.File]::ReadAllText($f) -split '\r?\n')[0])"
           }
-          [System.IO.File]::WriteAllText($f, $patched, [System.Text.Encoding]::ASCII)
-          Write-Host "Patched: $name"
+        } else {
+          Write-Host "STILL NOT FOUND: $f"
         }
 
     - name: Setup Rust nightly
