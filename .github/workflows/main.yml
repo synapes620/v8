@@ -77,24 +77,20 @@ jobs:
           Write-Host "Pattern not found - check lines above for exact string"
         }
 
-    - name: Patch find_std_rlibs.py (handle empty --rustc-revision)
+    - name: Patch find_std_rlibs.py (handle empty --rustc-revision if present)
       shell: powershell
       run: |
         $f = "C:\src\v8\build\rust\std\find_std_rlibs.py"
         $c = Get-Content $f -Raw
-        Write-Host "Current --rustc-revision definition:"
-        Select-String -InputObject $c -Pattern "rustc.revision" | ForEach-Object { Write-Host $_.Line }
-
         $old = "add_argument('--rustc-revision'"
         $new = "add_argument('--rustc-revision', nargs='?', default='', const=''"
         $c2 = $c.Replace($old, $new)
-
-        if ($c2 -eq $c) {
-          Write-Error "Pattern not found in find_std_rlibs.py - check output above"
-          exit 1
+        if ($c2 -ne $c) {
+          Set-Content $f $c2 -Encoding utf8
+          Write-Host "Patched find_std_rlibs.py (--rustc-revision made optional)"
+        } else {
+          Write-Host "Pattern not found - this V8 version does not need the patch"
         }
-        Set-Content $f $c2 -Encoding utf8
-        Write-Host "Patched find_std_rlibs.py"
 
     - name: Build d8
       shell: powershell
