@@ -15,7 +15,7 @@ jobs:
       id: cache
       with:
         path: ~/v8_build/v8/out/Release/d8
-        key: v8-54e529af-linux-mca
+        key: v8-54e529af-linux-mca2
 
     - name: Install deps
       if: steps.cache.outputs.cache-hit != 'true'
@@ -42,14 +42,14 @@ jobs:
       run: |
         cd ~/v8_build/v8
         ./build/install-build-deps.sh --no-prompt
-        gn gen out/Release --args='is_debug=false v8_enable_sandbox=true v8_enable_memory_corruption_api=true symbol_level=1 is_component_build=false'
+        gn gen out/Release --args='is_debug=false v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_use_external_startup_data=false symbol_level=1 is_component_build=false'
         ninja -C out/Release d8 -j$(nproc)
 
     - name: Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: v8-54e529af-mca
-        name: d8 build (54e529af, memory-corruption-api)
+        tag_name: v8-54e529af-mca2
+        name: d8 build (54e529af, mca, embedded-snapshot)
         files: ~/v8_build/v8/out/Release/d8
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
