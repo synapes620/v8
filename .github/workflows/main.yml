@@ -1,0 +1,55 @@
+name: Build d8
+on: [workflow_dispatch]
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/cache@v4
+      id: cache
+      with:
+        path: ~/v8_build/v8/out/Release/d8
+        key: v8-54e529af-linux-mca
+
+    - name: Install deps
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get install -y python3 lsb-release curl
+        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git ~/depot_tools
+        echo "$HOME/depot_tools" >> $GITHUB_PATH
+
+    - name: Add PATH (cached)
+      if: steps.cache.outputs.cache-hit == 'true'
+      run: echo "$HOME/depot_tools" >> $GITHUB_PATH
+
+    - name: Fetch & checkout
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        mkdir -p ~/v8_build && cd ~/v8_build
+        fetch --nohooks v8
+        cd v8
+        git checkout 54e529af
+        gclient sync --with_branch_heads --with_tags
+
+    - name: Build
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        cd ~/v8_build/v8
+        ./build/install-build-deps.sh --no-prompt
+        gn gen out/Release --args='is_debug=false v8_enable_sandbox=true v8_enable_memory_corruption_api=true symbol_level=1 is_component_build=false'
+        ninja -C out/Release d8 -j$(nproc)
+
+    - name: Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v8-54e529af-mca
+        name: d8 build (54e529af, memory-corruption-api)
+        files: ~/v8_build/v8/out/Release/d8
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
