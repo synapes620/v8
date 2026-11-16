@@ -1,191 +1,55 @@
-name: Build V8 d8
-on: [push, workflow_dispatch]
+name: Build d8
+on: [workflow_dispatch]
+permissions:
+  contents: write
+
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 180
+
     steps:
-    - name: Setup depot_tools
-      shell: powershell
-      run: |
-        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
-        "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+    - uses: actions/checkout@v4
 
-    - name: Get cache week key
-      id: week
-      shell: powershell
-      run: |
-        $w = [math]::Floor((Get-Date).DayOfYear / 7)
-        "value=$w" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-    - name: Cache V8 source
-      uses: actions/cache@v4
-      id: cache-v8
+    - uses: actions/cache@v4
+      id: cache
       with:
-        path: C:\src
-        key: v8-src-${{ runner.os }}-w${{ steps.week.outputs.value }}
-        restore-keys: |
-          v8-src-${{ runner.os }}-
+        path: ~/v8_build/v8/out/Release/d8
+        key: v8-54e529af-linux
 
-    - name: Fetch V8 (no-history, skipped on cache hit)
-      if: steps.cache-v8.outputs.cache-hit != 'true'
-      shell: powershell
+    - name: Install deps
+      if: steps.cache.outputs.cache-hit != 'true'
       run: |
-        $env:DEPOT_TOOLS_WIN_TOOLCHAIN = 0
-        New-Item -ItemType Directory -Force -Path C:\src | Out-Null
-        Set-Location C:\src
-        # Write .gclient directly (gclient config --spec passes through cmd.exe which
-        # strips all double-quotes, producing invalid Python and "syntax error in .gclient").
-        # Use an array -join instead of a PowerShell @"..."@ heredoc because heredoc
-        # requires the closing "@ at column 0, which YAML block scalar indent rules forbid.
-        @(
-          'solutions = [',
-          '  {',
-          '    "name": "v8",',
-          '    "url": "https://chromium.googlesource.com/v8/v8.git",',
-          '    "deps_file": "DEPS",',
-          '    "custom_deps": {},',
-          '  }',
-          ']'
-        ) -join "`n" | Set-Content "C:\src\.gclient" -Encoding ascii -NoNewline
-        Write-Host "=== .gclient written ==="
-        Get-Content "C:\src\.gclient"
-        # --jobs 4 to prevent the gsutil lock race (error code 6) on cache miss
-        gclient.bat sync --no-history --with_branch_heads --jobs 4
+        sudo apt-get install -y python3 lsb-release curl
+        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git ~/depot_tools
+        echo "$HOME/depot_tools" >> $GITHUB_PATH
 
-    - name: Create SDK junction (fake 10.0.28000.0 -> real 10.0.26100.0)
-      shell: powershell
+    - name: Add PATH (cached)
+      if: steps.cache.outputs.cache-hit == 'true'
+      run: echo "$HOME/depot_tools" >> $GITHUB_PATH
+
+    - name: Fetch & checkout
+      if: steps.cache.outputs.cache-hit != 'true'
       run: |
-        $sdkRoot = "C:\Program Files (x86)\Windows Kits\10"
-        $avail = (Get-ChildItem "$sdkRoot\Include" |
-          Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-          Sort-Object Name -Descending |
-          Select-Object -First 1).Name
-        Write-Host "Available SDK: $avail"
-        $fake = "10.0.28000.0"
-        foreach ($sub in @('Include', 'Lib', 'bin')) {
-          $src = "$sdkRoot\$sub\$avail"
-          $dst = "$sdkRoot\$sub\$fake"
-          if ((Test-Path $src) -and !(Test-Path $dst)) {
-            New-Item -ItemType Junction -Path $dst -Target $src -Force | Out-Null
-            Write-Host "Junction: $sub\$fake -> $sub\$avail"
-          }
-        }
+        mkdir -p ~/v8_build && cd ~/v8_build
+        fetch --nohooks v8
+        cd v8
+        git checkout 54e529af
+        gclient sync --with_branch_heads --with_tags
 
-    - name: Patch Windows SDK headers (inject missing minwinbase.h include)
-      shell: powershell
+    - name: Build
+      if: steps.cache.outputs.cache-hit != 'true'
       run: |
-        # Error chain: windows.h:176 -> winbase.h:43 -> fileapifromapp.h:20 -> fileapi.h:1081
-        # fileapi.h uses FILE_INFO_BY_HANDLE_CLASS which is defined in minwinbase.h,
-        # but minwinbase.h hasn't been included yet at that point in the chain.
-        # Fix: patch fileapifromapp.h to include minwinbase.h before it includes fileapi.h.
-        $sdkInc = "C:\Program Files (x86)\Windows Kits\10\include\10.0.28000.0\um"
-        Write-Host "=== SDK dir contents (first 5 files) ==="
-        if (Test-Path $sdkInc) {
-          Get-ChildItem $sdkInc | Select-Object -First 5 | ForEach-Object { Write-Host $_.Name }
-        } else {
-          Write-Host "DIR NOT FOUND: $sdkInc"
-        }
-        # Patch fileapifromapp.h: add #include <minwinbase.h> right before #include <fileapi.h>
-        $target = "fileapifromapp.h"
-        $f = "$sdkInc\$target"
-        if (!(Test-Path $f)) {
-          Write-Host "NOT FOUND: $f - trying 10.0.26100.0 directly"
-          $sdkInc = "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um"
-          $f = "$sdkInc\$target"
-        }
-        if (Test-Path $f) {
-          $c = [System.IO.File]::ReadAllText($f)
-          Write-Host "=== $target first 5 lines ==="
-          ($c -split '\r?\n' | Select-Object -First 5) | ForEach-Object { Write-Host $_ }
-          if ($c -match 'minwinbase') {
-            Write-Host "$target already has minwinbase - skipping"
-          } else {
-            # Prepend include at top of file (before any guards) - most reliable
-            $patched = "#include <minwinbase.h>`r`n" + $c
-            [System.IO.File]::WriteAllText($f, $patched)
-            Write-Host "Patched: $target"
-            Write-Host "Verify first line: $(([System.IO.File]::ReadAllText($f) -split '\r?\n')[0])"
-          }
-        } else {
-          Write-Host "STILL NOT FOUND: $f"
-        }
+        cd ~/v8_build/v8
+        ./build/install-build-deps.sh --no-prompt
+        gn gen out/Release --args='is_debug=false v8_enable_sandbox=true symbol_level=1 is_component_build=false'
+        ninja -C out/Release d8 -j$(nproc)
 
-    - name: Setup Rust nightly
-      uses: dtolnay/rust-toolchain@nightly
+    - name: Release
+      uses: softprops/action-gh-release@v2
       with:
-        targets: x86_64-pc-windows-msvc
-
-    - name: Patch sandbox testing for Windows (remove Linux-only crash filter restriction)
-      shell: powershell
-      run: |
-        $f = "C:\src\v8\src\sandbox\testing.cc"
-        $c = Get-Content $f -Raw
-        Write-Host "Lines mentioning Linux in testing.cc:"
-        Select-String -InputObject $c -Pattern "Linux" | ForEach-Object { Write-Host $_.Line }
-        $old = 'FATAL("The sandbox crash filter is currently only available on Linux");'
-        $new = '// Sandbox crash filter not supported on Windows - skip'
-        $c2 = $c.Replace($old, $new)
-        if ($c2 -ne $c) {
-          Set-Content $f $c2 -Encoding utf8
-          Write-Host "Patched sandbox testing.cc"
-        } else {
-          Write-Host "Pattern not found - check lines above for exact string"
-        }
-
-    - name: Patch find_std_rlibs.py (handle empty --rustc-revision if present)
-      shell: powershell
-      run: |
-        $f = "C:\src\v8\build\rust\std\find_std_rlibs.py"
-        # Base64-encoded Python patcher (avoids YAML/PowerShell quote escaping issues)
-        $b64 = "aW1wb3J0IHJlLCBzeXMKZiA9IHN5cy5hcmd2WzFdCndpdGggb3BlbihmLCBlbmNvZGluZz0ndXRmLTgnKSBhcyBmcDoKICAgIGMgPSBmcC5yZWFkKCkKZm9yIGksIGxpbmUgaW4gZW51bWVyYXRlKGMuc3BsaXRsaW5lcygpLCAxKToKICAgIGlmICdydXN0YycgaW4gbGluZSBhbmQgJ3JldmlzaW9uJyBpbiBsaW5lOgogICAgICAgIHByaW50KCdMaW5lICVkOiAlcycgJSAoaSwgcmVwcihsaW5lKSkpCnBhdHRlcm4gPSByJyItLXJ1c3RjLXJldmlzaW9uIiwnCnJlcGxhY2VtZW50ID0gJyItLXJ1c3RjLXJldmlzaW9uIiwgbmFyZ3M9Ij8iLCBkZWZhdWx0PSIiLCBjb25zdD0iIiwnCm5ldyA9IHJlLnN1YihwYXR0ZXJuLCByZXBsYWNlbWVudCwgYykKaWYgbmV3ICE9IGM6CiAgICB3aXRoIG9wZW4oZiwgJ3cnLCBlbmNvZGluZz0ndXRmLTgnKSBhcyBmcDoKICAgICAgICBmcC53cml0ZShuZXcpCiAgICBwcmludCgnUGF0Y2hlZCBmaW5kX3N0ZF9ybGlicy5weScpCmVsc2U6CiAgICBwcmludCgnUGF0dGVybiBub3QgZm91bmQgLSBubyBwYXRjaCBuZWVkZWQnKQo="
-        python3 -I -c "import base64,sys; open('C:/patch_rlibs.py','w').write(base64.b64decode('$b64').decode())"
-        python3 -I "C:\patch_rlibs.py" "$f"
-
-    - name: Build d8
-      shell: powershell
-      run: |
-        $ErrorActionPreference = "Stop"
-        $env:DEPOT_TOOLS_WIN_TOOLCHAIN = 0
-
-        $rustSysroot = (rustc --print sysroot 2>&1).Trim() -replace '\\', '/'
-        Write-Host "Rust sysroot: $rustSysroot"
-
-        $outDir = "C:\src\v8\out\x64.release"
-        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-
-        $l1 = 'is_debug = false'
-        $l2 = 'target_cpu = "x64"'
-        $l3 = 'rust_sysroot_absolute = "' + $rustSysroot + '"'
-        $l4 = 'v8_enable_memory_corruption_api = true'
-        # Force-include minwinbase.h to fix FILE_INFO_BY_HANDLE_CLASS with Clang-cl
-        # (fileapi.h uses it but doesn't include its defining header in SDK 10.0.26100.0)
-        $l5 = 'extra_cflags = "/FIminwinbase.h"'
-        "$l1`n$l2`n$l3`n$l4`n$l5" | Set-Content -Path "$outDir\args.gn" -Encoding ascii
-
-        Write-Host "=== args.gn ==="
-        Get-Content "$outDir\args.gn"
-
-        cd C:\src\v8
-        gn.bat gen $outDir
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        ninja.bat -C $outDir d8
-
-    - name: Show build errors
-      if: failure()
-      shell: powershell
-      run: |
-        $out = "C:\src\v8\out\x64.release"
-        foreach ($f in @("siso_output", ".ninja_log")) {
-          $p = "$out\$f"
-          if (Test-Path $p) {
-            Write-Host "=== $f (last 150 lines) ==="
-            Get-Content $p -Tail 150
-          }
-        }
-
-    - name: Upload d8
-      uses: actions/upload-artifact@v4
-      with:
-        name: d8-win-x64
-        path: C:\src\v8\out\x64.release\d8.exe
+        tag_name: v8-54e529af
+        name: d8 build (54e529af)
+        files: ~/v8_build/v8/out/Release/d8
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
