@@ -1,12 +1,16 @@
 'use strict';
-// Native Heap Outside Sandbox Escape PoC
+// Native Heap Outside Sandbox Escape PoC  (crash / address-proof variant)
+//
+// Proves the escape mechanism: Stage 4 write lands at SB_END+4 (SEGV_ACCERR confirms
+// the fault address is outside the sandbox VA).  For a successful non-crashing write,
+// see heap_escape_success.js + heap_escape_gdb.sh.
 //
 // CHAIN:
 //   Stage 1: in-sandbox arbitrary write  (Sandbox.MemoryView — simulates real in-sandbox JS bug)
 //   Stage 2: create MemoryView backed at SB_END - 4 GB (last 4 GB of sandbox VA reservation)
 //   Stage 3: corrupt DataView byte_length to 32 GB via in-sandbox write to JSDataView+0x24
 //            JSDataView byte_length encoding: field × 8 = JS byteLength  (verified)
-//   Stage 4: write at offset > 4 GB → address > SB_END → outside sandbox VA
+//   Stage 4: write at offset > 4 GB → address > SB_END → SEGV_ACCERR at SB_END+4 (outside VA)
 //
 // byte_length layout (verified empirically):
 //   JSArrayBuffer: +0x18 (raw_byte_length) and +0x20 (byte_length), encoding: field×8 = byteLength
