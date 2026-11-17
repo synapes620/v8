@@ -77,12 +77,11 @@ hi4 = byteLength >> 3; the check `hi4 * 8 == byteLength` holds exactly
 when byteLength is a multiple of 8 (true for all standard ArrayBuffer
 sizes).  This encoding is verified empirically before any corruption.
 
-The ExternalPointerTable handle at +0x2c is a non-zero small integer
-(0x03000040 / 0x04000040 observed across runs) confirming that the
-backing-store pointer goes through the EPT mechanism.  The EPT handle is
-an index into the ExternalPointerTable, not a raw address; the EPT itself
-lives outside the sandbox VA and maps indices to native addresses by
-design.
+The value at +0x2c (0x03000040 / 0x04000040 across runs) was initially
+identified as an ExternalPointerTable handle.  GDB verification shows this
+interpretation was incorrect: JSDataView's raw_byte_length_ ends at +0x28,
+so +0x2c falls into the next sandbox object.  The read-out value is likely
+the map pointer of the adjacent heap object, not an EPT handle.
 
 Stage 4: Corrupt raw_byte_length_ high 4 bytes with one in-sandbox DWORD write
 ------------------------------------------------------------------------------
@@ -161,13 +160,17 @@ Observed output (one of multiple ASLR runs, x86-64):
   ab_target[2] = 0xcafebabe ✓
   ab_target[3] = 0xfeedface ✓
   Stage 7a fault probe: "Caught harmless memory access violation (inside sandbox)."
-    → H + 32 MB ∈ [SB_BASE, SB_END) → H within 32 MB below SB_BASE (native heap)
+    → H + 32 MB ∈ [SB_BASE, SB_END) → consistent with H inside sandbox VA
+  GDB verification (gdb -batch, Python memory search):
+    Found 0xC0DECAFE at 0x93000005000  (= H + found_offset = H + 0x1000)
+    H = 0x93000004000, SB_BASE = 0x92d00000000, SB_END = 0xa2d00000000
+    H − SB_BASE = 0x300004000 ≈ 12 GB → H is INSIDE sandbox VA
+    → OOB write target is in-sandbox, not outside [SB_BASE, SB_END)
 
-Stage 7a: Fault probe — classify backing store location via crash filter
-------------------------------------------------------------------------
-After all assertions pass, the PoC performs one intentional out-of-bounds
-write at offset +0x2000000 (32 MB past the backing store) to probe the
-crash filter's classification of the backing store's native address H.
+Stage 7a: Fault probe — crash filter classification
+----------------------------------------------------
+After all assertions pass, the PoC performs one intentional write at offset
++0x2000000 (32 MB past the backing store) to probe the crash filter.
 
 V8's sandbox crash filter under --sandbox-testing:
   fault inside  [SB_BASE, SB_END) → "Caught harmless ... (inside sandbox)" exit 0
@@ -175,17 +178,24 @@ V8's sandbox crash filter under --sandbox-testing:
 
 Result: "Caught harmless memory access violation (inside sandbox)."
 
-Interpretation: H + 32 MB ∈ [SB_BASE, SB_END), which constrains
-H ∈ [SB_BASE − 32 MB, SB_END).  Combined with the EPT handle at +0x2c,
-which V8's ExternalPointerTable is designed to map only to addresses outside
-the sandbox VA, the backing store H is native heap memory at most 32 MB
-below SB_BASE.  The write target at H + 0x1000 (confirmed in Stage 7) is
-therefore also in native heap outside [SB_BASE, SB_END).
+The fault probe result (H + 32 MB ∈ sandbox) is consistent with H being
+anywhere inside [SB_BASE − 32 MB, SB_END).  It does not, by itself,
+distinguish H < SB_BASE from H ∈ [SB_BASE, SB_END).
 
-Note: the exact value of H is not independently measurable from pure
-JavaScript; GDB or /proc/<pid>/maps would show it precisely.  The EPT
-structural guarantee and the crash filter bound together are sufficient
-to characterise the write target as native heap outside the sandbox VA.
+GDB verification (definitive): a GDB batch session was run against the
+same PoC with %SystemBreak() inserted after Stage 7.  After stopping at
+the break, a Python script searched all memory mappings for 0xC0DECAFE
+(the OOB-written value).  Result:
+
+  Found 0xC0DECAFE at 0x93000005000  (= H + found_offset = H + 0x1000)
+  H = 0x93000004000
+  SB_BASE = 0x92d00000000  SB_END = 0xa2d00000000
+  H − SB_BASE = 0x300004000 ≈ 12 GB
+
+H is INSIDE [SB_BASE, SB_END).  The OOB write target is in-sandbox memory.
+V8 allocates 4 KB ArrayBuffer backing stores within the sandbox VA on this
+build/platform.  This is confirmed directly by GDB; the pure-JS fault probe
+alone is insufficient to distinguish the two cases.
 
 Testing mode
 ------------
@@ -245,17 +255,22 @@ ab_victim.
 The in-object layout of JSDataView, with protection status:
 
   Offset  Field               Encoding                 Sandbox-protected?
-  +0x14   bit_field           raw 32-bit int           NO   (plain field)
+  +0x0c   buffer              compressed ptr (4 B)     YES  (JSArrayBuffer via ptr compression)
+  +0x10   bit_field           raw 32-bit int           NO   (plain field)
   +0x18   raw_byte_offset     uintptr (8 B, kBS=29)    NO   (plain field)
   +0x20   raw_byte_length_    uintptr (8 B, kBS=29)    NO   (plain field — THIS BUG)
   +0x24     ↳ high 4 bytes    write target             —    (PoC writes here)
-  +0x2c   backing_store       EPT handle               YES  (ExternalPointerTable)
+  +0x28   [end of object]
+
+  Note: the backing-store pointer lives in the referenced JSArrayBuffer object,
+  not in JSDataView directly.  The value at JSDataView+0x2c is the first 4 bytes
+  of the adjacent sandbox heap object, not an EPT handle.
 
 (kBS = kBoundedSizeShift = 29; PoC confirmed offsets empirically via
 Sandbox.getAddressOf and in-sandbox reads before corruption.)
 
-The backing-store pointer at +0x2c is protected: it is stored as an EPT
-index, and the EPT maps that index to a native address outside the sandbox VA.
+The backing-store pointer (in JSArrayBuffer, accessed through the `buffer`
+reference at +0x0c of JSDataView) is protected via the ExternalPointerTable.
 An attacker cannot forge this pointer from within the sandbox.  The
 raw_byte_length field at +0x24 receives no equivalent protection; it can be
 set to any value, and V8 uses that value to bound all subsequent DataView
@@ -282,18 +297,19 @@ sandbox-relative offsets.
 
 An attacker who chains this bug after any existing in-sandbox write achieves
 out-of-bounds write access up to ~32 GiB beyond the original DataView bounds.
-The fault probe in Stage 7a shows the backing store H lies within 32 MB below
-SB_BASE (confirmed by crash filter classification and the EPT handle, which
-by V8 design stores native addresses outside the sandbox VA).  The write
-target at H + found_offset is therefore in native heap memory outside
-[SB_BASE, SB_END).
+GDB verification (see Stage 7a above) shows the backing store H is at
+H = 0x93000004000, SB_BASE = 0x92d00000000: H is inside [SB_BASE, SB_END),
+approximately 12 GB above SB_BASE.  The write target at H + found_offset is
+therefore in-sandbox memory.
 
 The concrete impact depends on what occupies memory adjacent to the victim
 backing store.  In this demonstration it is another ArrayBuffer's backing
-store in native heap.  In a renderer process exploitation context, adjacent
-native heap objects can include EPT entries (overwriting which allows forging
-native pointers), function pointers, or other process-level structures, any
-of which can facilitate further privilege escalation.
+store (also in-sandbox).  In a broader exploitation context, the ~32 GiB
+inflated window can reach arbitrary in-sandbox objects: other JSArrayBuffers,
+their type information, EPT handles within JSArrayBuffer objects, or other
+sandbox structures.  Overwriting an EPT handle within a JSArrayBuffer object
+would allow forging backing-store pointers and achieving a Tier-3 escape;
+however this secondary step is not demonstrated in this PoC.
 
 The vulnerability affects all 64-bit platforms on which the 1 TB V8 sandbox
 is active, including desktop Chrome and Chromium on x86-64 and arm64.
