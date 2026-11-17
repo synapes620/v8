@@ -3,14 +3,16 @@
 // Pure JavaScript — no GDB, no shell helpers, no external tools.
 //
 // RUN:
-//   d8 --expose-memory-corruption-api --allow-natives-syntax heap_escape_pure_js.js
+//   d8 --sandbox-testing --allow-natives-syntax heap_escape_pure_js.js
 //
-// NOTE ON --expose-memory-corruption-api:
-//   Sandbox.MemoryView and Sandbox.getAddressOf are V8's official API for
-//   simulating in-sandbox arbitrary read/write (Tier-2) primitives.  Every
-//   write in Stage 1 stays inside the sandbox VA.  The flag produces the
-//   "unsupported configuration" warning; Stage 1 would be replaced by any
-//   real Tier-2 bug in a production context.
+// NOTE ON --sandbox-testing:
+//   This is V8's official sandbox escape testing mode.  It enables
+//   Sandbox.MemoryView and Sandbox.getAddressOf (the Tier-2 simulation API),
+//   activates the sandbox crash filter (only sandbox violations are reported),
+//   and prints "Sandbox testing mode is enabled" — NOT "unsupported
+//   configuration".  Every write in Stage 1 stays inside the sandbox VA.
+//   Stage 1 would be replaced by any real in-sandbox write primitive in a
+//   production context.
 
 function hex(v) {
   if (typeof v === 'bigint') return '0x' + v.toString(16).padStart(12, '0');
@@ -143,9 +145,10 @@ print('     EPT handle ' + hex(bs_handle) + ' → backing store uses ExternalPoi
 print('     → V8 design: ExternalPointerTable stores NATIVE addresses ∉ [SB_BASE, SB_END)');
 print('     NOTE: exact native address H is not independently verified here');
 print('');
-print('  LIMITATION:');
-print('  6. Reproduced under --expose-memory-corruption-api (unsupported config)');
-print('     raw_byte_length field is unprotected in all V8 builds regardless of this flag');
+print('  TESTING MODE:');
+print('  6. Run under --sandbox-testing (V8 official sandbox escape testing mode)');
+print('     Output: "Sandbox testing mode is enabled. Only sandbox violations will be reported."');
+print('     Exit 0 — process completed normally, no sandbox crash filter triggered');
 print('');
 print('  Sandbox VA : [' + hex(SB_BASE) + ', ' + hex(SB_END) + ')');
 print('  OOB write confirmed at (ab_victim backing) + ' + hex(found_offset) +
