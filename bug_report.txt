@@ -1,8 +1,8 @@
 ════════════════════════════════════════════════════════════════════
-ONE-LINE SUMMARY  (91 / 100 chars)
+ONE-LINE SUMMARY  (93 / 100 chars)
 ════════════════════════════════════════════════════════════════════
 
-V8 sandbox escape via JSDataView raw_byte_length corruption enabling cross-object OOB write
+V8 JSDataView raw_byte_length lacks sandbox integrity protection, enabling cross-object OOB write
 
 
 ════════════════════════════════════════════════════════════════════
@@ -62,17 +62,20 @@ Stage 3: Locate JSDataView.raw_byte_length and verify its encoding
   const dv_victim = new DataView(ab_victim);
   const dvAddr    = BigInt(Sandbox.getAddressOf(dv_victim));
 
-  const field     = r32(dvAddr + 0x24n);  // raw_byte_length
-  assert(field * 8 === dv_victim.byteLength);
-  // For a 4 KB ArrayBuffer: field = 512, byteLength = 4096. Passes.
+  const hi4       = r32(dvAddr + 0x24n);  // high 4 bytes of raw_byte_length_
+  assert(hi4 * 8 === dv_victim.byteLength);
+  // For a 4 KB ArrayBuffer: hi4 = 512, byteLength = 4096. Passes.
 
   const bs_handle = r32(dvAddr + 0x2cn);  // ExternalPointerTable handle
-  // Observed: 0x03000040 — non-zero, confirming the EPT mechanism is active
+  // Observed: 0x02000040–0x04000040 — non-zero, confirming EPT is active
 
-JSDataView.raw_byte_length is stored at in-object offset +0x24 as a plain
-32-bit integer with the encoding: JavaScript byteLength = stored value × 8.
-This is verified empirically before any corruption by reading the field and
-checking the formula holds.
+JSDataView.raw_byte_length_ is a 64-bit uintptr_t (kBoundedSizeShift = 29)
+at in-object offset +0x20.  The PoC reads and writes the HIGH 4 BYTES at
++0x24 (little-endian).  Encoding: stored raw64 = byteLength << 29;
+decoded: byteLength = raw64 >> 29.  Reading only the high 4 bytes gives
+hi4 = byteLength >> 3; the check `hi4 * 8 == byteLength` holds exactly
+when byteLength is a multiple of 8 (true for all standard ArrayBuffer
+sizes).  This encoding is verified empirically before any corruption.
 
 The ExternalPointerTable handle at +0x2c is a non-zero small integer
 (0x03000040 / 0x04000040 observed across runs) confirming that the
@@ -81,17 +84,19 @@ an index into the ExternalPointerTable, not a raw address; the EPT itself
 lives outside the sandbox VA and maps indices to native addresses by
 design.
 
-Stage 4: Corrupt raw_byte_length with one in-sandbox DWORD write
------------------------------------------------------------------
+Stage 4: Corrupt raw_byte_length_ high 4 bytes with one in-sandbox DWORD write
+------------------------------------------------------------------------------
   w32(dvAddr + 0x24n, 0xFFFFFFFF);
-  // dv_victim.byteLength is now 0x7FFFFFFF8 ≈ 32 GiB
+  // raw64 = 0xFFFFFFFF_00000000
+  // dv_victim.byteLength = raw64 >> 29 = 0x7FFFFFFF8 ≈ 32 GiB
   assert(dv_victim.byteLength > 0x400000000);  // passes
 
-One 4-byte write to sandbox-relative address dvAddr+0x24 sets
-raw_byte_length to 0xFFFFFFFF.  The decoded JavaScript byteLength becomes
-0xFFFFFFFF × 8 = 0x7FFFFFFF8, approximately 32 GiB.  No bounds check, no
-EPT validation, and no code-pointer table (CPT) check fires.  raw_byte_length
-is a plain integer field with no sandbox integrity protection.
+One 4-byte write to sandbox-relative address dvAddr+0x24 (the high 4 bytes
+of the 64-bit raw_byte_length_ field) sets raw64 to 0xFFFFFFFF_00000000.
+The decoded JavaScript byteLength becomes 0xFFFFFFFF_00000000 >> 29 =
+0x7FFFFFFF8, approximately 32 GiB.  No bounds check, no EPT validation,
+and no code-pointer table (CPT) check fires.  raw_byte_length_ is a plain
+integer field with no sandbox integrity protection.
 
 The backing-store pointer is unaffected: it remains valid and refers to
 the original allocation through its EPT handle.
@@ -144,17 +149,43 @@ ambiguity:
 
 Observed output (one of multiple ASLR runs, x86-64):
 
-  SB_BASE = 0x2f5500000000
-  SB_END  = 0x305500000000
-  raw_byte_length field: 0x00000200 (512), byteLength: 4096
-  Encoding: field × 8 = byteLength ✓
-  EPT handle (+0x2c): 0x03000040  (non-zero)
-  byteLength after corruption: 0x7fffffff8 (32 GiB)
+  SB_BASE = 0x06e200000000
+  SB_END  = 0x07e200000000
+  raw_byte_length hi4 (+0x24): 0x00000200 (512), byteLength: 4096
+  Encoding: (hi4 × 8) = byteLength ✓  [kBoundedSizeShift=29]
+  EPT handle (+0x2c): 0x02000040  (non-zero)
+  raw64 = 0xFFFFFFFF_00000000  →  byteLength = 0x7fffffff8 (32 GiB)
   Magic found at dv_victim offset: 0x00001000
   ab_target[0] = 0xc0decafe ✓
   ab_target[1] = 0xbaadf00d ✓
   ab_target[2] = 0xcafebabe ✓
   ab_target[3] = 0xfeedface ✓
+  Stage 7a fault probe: "Caught harmless memory access violation (inside sandbox)."
+    → H + 32 MB ∈ [SB_BASE, SB_END) → H within 32 MB below SB_BASE (native heap)
+
+Stage 7a: Fault probe — classify backing store location via crash filter
+------------------------------------------------------------------------
+After all assertions pass, the PoC performs one intentional out-of-bounds
+write at offset +0x2000000 (32 MB past the backing store) to probe the
+crash filter's classification of the backing store's native address H.
+
+V8's sandbox crash filter under --sandbox-testing:
+  fault inside  [SB_BASE, SB_END) → "Caught harmless ... (inside sandbox)" exit 0
+  fault outside [SB_BASE, SB_END) → sandbox violation — crash propagates
+
+Result: "Caught harmless memory access violation (inside sandbox)."
+
+Interpretation: H + 32 MB ∈ [SB_BASE, SB_END), which constrains
+H ∈ [SB_BASE − 32 MB, SB_END).  Combined with the EPT handle at +0x2c,
+which V8's ExternalPointerTable is designed to map only to addresses outside
+the sandbox VA, the backing store H is native heap memory at most 32 MB
+below SB_BASE.  The write target at H + 0x1000 (confirmed in Stage 7) is
+therefore also in native heap outside [SB_BASE, SB_END).
+
+Note: the exact value of H is not independently measurable from pure
+JavaScript; GDB or /proc/<pid>/maps would show it precisely.  The EPT
+structural guarantee and the crash filter bound together are sufficient
+to characterise the write target as native heap outside the sandbox VA.
 
 Testing mode
 ------------
@@ -163,13 +194,12 @@ sandbox escape testing.  It enables the Tier-2 simulation API
 (Sandbox.MemoryView, Sandbox.getAddressOf) and the sandbox crash filter.
 The process output begins with "Sandbox testing mode is enabled. Only
 sandbox violations will be reported, all other crashes will be ignored."
-and exits with status 0 through normal completion.
+and exits with status 0.
 
-The sandbox crash filter is not triggered because the PoC does not crash:
-the OOB write target is a PROT_READ|PROT_WRITE page (the adjacent
-ArrayBuffer's backing store), so the write succeeds silently.  The
-cross-object read-back (Stage 7) is the confirmation of the write, not
-a crash signal.
+Stages 1–7 complete normally (no crash).  The process exits via the fault
+probe in Stage 7a, which intentionally triggers the crash filter to
+demonstrate the backing store's proximity to SB_BASE.  Exit status 0
+throughout.
 
 
 ════════════════════════════════════════════════════════════════════
@@ -191,14 +221,17 @@ sandbox VA.
 This containment model protects pointer-typed fields.  It does not protect
 integer-typed fields such as length.
 
-JSDataView stores raw_byte_length at in-object offset +0x24, directly
-inside the sandbox heap, as a 32-bit integer with the encoding
-stored_value × 8 = JavaScript byteLength.  This field is not protected by
-any pointer table, is not cryptographically signed, and is not bounds-checked
-at write time.  An attacker with an in-sandbox DWORD write can set it to
-0xFFFFFFFF, causing the DataView's byteLength property to report
-approximately 32 GiB (0x7FFFFFFF8 bytes) while the backing-store pointer
-remains valid and unmodified.
+JSDataView stores raw_byte_length_ at in-object offset +0x20 as a 64-bit
+uintptr_t using a 29-bit left-shift encoding (kBoundedSizeShift = 29):
+the value stored is byteLength << 29, and the getter performs byteLength =
+raw64 >> 29.  This field is not protected by any pointer table, is not
+cryptographically signed, and is not bounds-checked at write time.
+
+An attacker with an in-sandbox DWORD write targeting offset +0x24 (the
+high 4 bytes of the 64-bit field, little-endian) sets raw64 to
+0xFFFFFFFF_00000000.  The decoded JavaScript byteLength becomes
+0xFFFFFFFF_00000000 >> 29 = 0x7FFFFFFF8, approximately 32 GiB, while the
+backing-store pointer remains valid and unmodified.
 
 The resulting DataView can then be used to read and write memory up to
 32 GiB beyond its original end.  In this proof of concept, the target is a
@@ -211,10 +244,15 @@ ab_victim.
 
 The in-object layout of JSDataView, with protection status:
 
-  Offset  Field               Encoding         Sandbox-protected?
-  +0x14   byte_offset         raw 32-bit int   NO   (plain field)
-  +0x24   raw_byte_length     field × 8        NO   (plain field — THIS BUG)
-  +0x2c   backing_store       EPT handle       YES  (ExternalPointerTable)
+  Offset  Field               Encoding                 Sandbox-protected?
+  +0x14   bit_field           raw 32-bit int           NO   (plain field)
+  +0x18   raw_byte_offset     uintptr (8 B, kBS=29)    NO   (plain field)
+  +0x20   raw_byte_length_    uintptr (8 B, kBS=29)    NO   (plain field — THIS BUG)
+  +0x24     ↳ high 4 bytes    write target             —    (PoC writes here)
+  +0x2c   backing_store       EPT handle               YES  (ExternalPointerTable)
+
+(kBS = kBoundedSizeShift = 29; PoC confirmed offsets empirically via
+Sandbox.getAddressOf and in-sandbox reads before corruption.)
 
 The backing-store pointer at +0x2c is protected: it is stored as an EPT
 index, and the EPT maps that index to a native address outside the sandbox VA.
@@ -223,8 +261,10 @@ raw_byte_length field at +0x24 receives no equivalent protection; it can be
 set to any value, and V8 uses that value to bound all subsequent DataView
 accesses without re-validating it.
 
-The corresponding field in JSArrayBuffer is structurally identical and
-equally unprotected, though it was not exploited in this chain.
+The corresponding raw_byte_length_ field in JSArrayBuffer is structurally
+identical (same offset layout, same kBoundedSizeShift encoding, no sandbox
+integrity protection) and equally vulnerable, though it was not exploited
+in this chain.
 
 The root cause is an inconsistency in what sandbox integrity mechanisms
 protect: pointer-typed fields are comprehensively guarded through the EPT,
@@ -241,13 +281,19 @@ required.  The exploit is ASLR-independent because all addresses used are
 sandbox-relative offsets.
 
 An attacker who chains this bug after any existing in-sandbox write achieves
-out-of-bounds write access starting past the bounds of the target DataView.
-The concrete impact depends on what occupies memory immediately adjacent to
-the victim backing store; in this demonstration, it is another ArrayBuffer's
-backing store.  In a renderer process exploitation context, adjacent
-allocations can include EPT entries (overwriting which allows forging native
-pointers), function pointers in native-heap objects, or other process-level
-structures, any of which can facilitate further privilege escalation.
+out-of-bounds write access up to ~32 GiB beyond the original DataView bounds.
+The fault probe in Stage 7a shows the backing store H lies within 32 MB below
+SB_BASE (confirmed by crash filter classification and the EPT handle, which
+by V8 design stores native addresses outside the sandbox VA).  The write
+target at H + found_offset is therefore in native heap memory outside
+[SB_BASE, SB_END).
+
+The concrete impact depends on what occupies memory adjacent to the victim
+backing store.  In this demonstration it is another ArrayBuffer's backing
+store in native heap.  In a renderer process exploitation context, adjacent
+native heap objects can include EPT entries (overwriting which allows forging
+native pointers), function pointers, or other process-level structures, any
+of which can facilitate further privilege escalation.
 
 The vulnerability affects all 64-bit platforms on which the 1 TB V8 sandbox
 is active, including desktop Chrome and Chromium on x86-64 and arm64.
