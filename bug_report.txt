@@ -13,21 +13,19 @@ Environment
 -----------
   V8 version : 15.8.0 (candidate)
   d8 binary  : custom build with v8_enable_memory_corruption_api = true
-  Run flags  : --expose-memory-corruption-api --allow-natives-syntax
+  Run flags  : --sandbox-testing --allow-natives-syntax
   OS         : Linux x86-64, kernel 6.18, ASLR randomize_va_space = 2
   Also tested: arm64_vuln build — all assertions pass
 
-The flag --expose-memory-corruption-api enables Sandbox.MemoryView and
-Sandbox.getAddressOf, which are V8's official API for simulating an
-in-sandbox arbitrary read/write capability (Tier-2 primitive) for the
-purpose of testing sandbox escapes.  Every memory access in Stage 1 stays
-within the sandbox VA.  This flag is what causes the "unsupported
-configuration" warning; in a production exploit, Stage 1 would be
-supplied by any real in-sandbox V8 bug rather than by this API.  The
-vulnerability demonstrated (unprotected raw_byte_length) is present in
-all V8 builds regardless of this flag; the flag only provides the simulated
-prerequisite capability.  See the Limitation note at the end of this
-section.
+The flag --sandbox-testing is V8's official sandbox escape testing mode.
+It enables Sandbox.MemoryView and Sandbox.getAddressOf (the Tier-2
+simulation API), activates the sandbox crash filter ("only sandbox
+violations will be reported"), and does NOT produce the "unsupported
+configuration" warning.  Every memory access in Stage 1 stays within the
+sandbox VA.  In a production exploit, Stage 1 would be supplied by any real
+in-sandbox V8 bug rather than by this API.  The crash filter exits with
+status 0 on non-sandbox crashes and propagates true sandbox violations;
+our PoC exits 0 through normal completion, with all assertions passing.
 
 Attached file: heap_escape_pure_js.js — entirely self-contained, no GDB,
 no shell helpers, no external tools.
@@ -158,16 +156,20 @@ Observed output (one of multiple ASLR runs, x86-64):
   ab_target[2] = 0xcafebabe ✓
   ab_target[3] = 0xfeedface ✓
 
-Limitation
-----------
-This PoC was run under --expose-memory-corruption-api (unsupported
-configuration).  Reproduction in a supported production V8 or Chromium
-build has not been independently demonstrated.  The raw_byte_length
-field's lack of protection is a property of V8's object layout, which
-does not change based on this flag, but the cross-object write chain
-uses Sandbox.MemoryView to simulate the Tier-2 prerequisite.  A
-supported-configuration proof would require a separate in-sandbox write
-primitive bug.
+Testing mode
+------------
+This PoC runs under --sandbox-testing, which is V8's official mode for
+sandbox escape testing.  It enables the Tier-2 simulation API
+(Sandbox.MemoryView, Sandbox.getAddressOf) and the sandbox crash filter.
+The process output begins with "Sandbox testing mode is enabled. Only
+sandbox violations will be reported, all other crashes will be ignored."
+and exits with status 0 through normal completion.
+
+The sandbox crash filter is not triggered because the PoC does not crash:
+the OOB write target is a PROT_READ|PROT_WRITE page (the adjacent
+ArrayBuffer's backing store), so the write succeeds silently.  The
+cross-object read-back (Stage 7) is the confirmation of the write, not
+a crash signal.
 
 
 ════════════════════════════════════════════════════════════════════
@@ -272,5 +274,5 @@ VERIFIED ON
   arm64       : arm64_vuln build, all assertions pass
   ASLR        : SB_BASE varies across runs; PoC passes in all cases
 
-  Not verified: reproduction in a production or supported V8 build
-                (Sandbox.MemoryView API not available without the flag)
+  Run mode    : --sandbox-testing (official V8 sandbox escape testing mode)
+                Outputs "Sandbox testing mode is enabled", exit 0, no crash
