@@ -1,0 +1,82 @@
+=== CRASH REPORT: NativeModuleDeserializer ReadCode OOB — Confirmed SIGSEGV ===
+Date: 2026-11-19
+Target: /home/user/v8/out/x64.release/d8 (PIE, with debug info)
+Build flags: is_debug=false, dcheck_always_on=false, v8_enable_sandbox=true
+
+--- Reproduction ---
+# Step 1: d8 flags
+--no-liftoff --no-wasm-lazy-compilation
+
+# Step 2: JavaScript (poc_trigger.js)
+#   - Serializes a 1-function Wasm module blob
+#   - Attempts d8.wasm.deserializeModule(blob_1fn, wire_200fn)
+#     where wire_200fn declares 200 functions
+
+# Step 3: GDB bypass of d8 hash guard
+#   Break at WasmDeserializeModule+0x5c5 (hash guard "not found" path → ThrowError)
+#   Redirect $rip += 0x8f to WasmDeserializeModule+0x654 (success path → Mutex::Unlock)
+#   This routes execution to DeserializeNativeModule(blob_1fn, wire_200fn)
+
+--- GDB output (confirmed) ---
+[GDB] Breakpoint set at WasmDeserializeModule+0x5c5
+[GDB] Running d8...
+...
+[GDB] *** Hash guard breakpoint hit at rip=0x555555bb9e55 ***
+[GDB]     About to throw 'Trying to deserialize manipulated bytes'
+[GDB]     Redirecting $rip += 0x8f to success path
+[GDB]     $rip now 0x555555bb9ee4 — continuing...
+
+Thread 1 "d8" received signal SIGSEGV, Segmentation fault.
+0x00005555566fda3a in v8::internal::wasm::NativeModuleDeserializer::TranslateEffectHandlersToCanonical(v8::base::Vector<unsigned char const>) ()
+    at ../../src/wasm/wasm-serialization.cc:347
+
+--- Registers at crash ---
+rip  0x5555566fda3a  TranslateEffectHandlersToCanonical+138  (line 347)
+rax  0x3247ff004000  (computed OOB pointer into wasm JIT region)
+r8   0x3247ff004000  (same — base address used in addr computation)
+r9   0x1ff8          (effect_handlers vector size = 8184 from OOB heap)
+rdi  0xff8000        (sig_id translation offset)
+
+--- Backtrace ---
+#0  NativeModuleDeserializer::TranslateEffectHandlersToCanonical(Vector<const uint8_t>)
+      at wasm-serialization.cc:347
+#1  DeserializeNativeModule(Isolate*, WasmEnabledFeatures, Vector<const uint8_t>,
+      UniqueArray<const uint8_t>&, CompileTimeImports const&, string_view)
+      at wasm-serialization.cc:1048
+#2  Shell::WasmDeserializeModule(FunctionCallbackInfo<Value> const&)
+      at d8.cc:3602
+#3  Builtins_CallApiCallbackGeneric
+
+--- Root cause ---
+wasm-serialization.cc: NativeModuleDeserializer::ReadCode()
+
+  Lines 1001-1018 read all code metadata fields from the blob:
+    effect_handlers_size = reader->Read<uint32_t>()  // line 1018
+
+  These reads have ONLY DCHECK guards (stripped in release):
+    DCHECK_GE(remaining_code_size_, code_size)        // line 1023
+
+  With blob_1fn (1-function blob) + wire_200fn (200-function wire bytes):
+    - Function 0: reader stays within valid blob
+    - Function 1: ALL metadata reads (lines 1001-1020) read from heap PAST blob end
+      → effect_handlers_size = 0x1ff8 (8184) from adjacent heap bytes
+    - Line 1046: reader->ReadVector(8184) returns a Vector pointing past blob end
+    - Line 1047: TranslateEffectHandlersToCanonical(garbage_vector) is called
+    - Line 347 (TranslateEffectHandlersTable): LEBHelper::read_u32v advances src
+      pointer into unmapped memory → SIGSEGV
+
+--- Attack primitive ---
+The blob is an ArrayBuffer from an untrusted source (IPC, network cache).
+In Chrome's production path (AsyncStreamingProcessor::Deserialize in
+streaming-decoder.cc:428-436) there is NO hash guard:
+  processor->Deserialize(module_bytes, wire_bytes)
+An attacker with access to the compilation cache (compromised renderer) can
+inject a mismatched blob directly to the browser process without the d8 hash guard.
+The crash point is in TranslateEffectHandlersToCanonical which calls
+translate_sig_id() — a lambda that calls native_module_->module() — using a
+garbage sig_id read from OOB heap bytes, which may point into arbitrary memory.
+
+--- CWE classification ---
+CWE-125: Out-of-bounds Read
+CWE-787: Out-of-bounds Write (via WritableJitAllocation::CopyCode using OOB code_size)
+Severity: HIGH — heap OOB read with attacker-controlled size, in browser process

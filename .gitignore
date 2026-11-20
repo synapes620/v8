@@ -173,3 +173,7 @@ MODULE.bazel.lock
 GEMINI.md
 AGENTS.md
 /worktrees
+
+# VRP submission files (zero-day, do not expose)
+vrp/
+vrp_report_full.md

