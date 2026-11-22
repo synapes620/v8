@@ -297,8 +297,8 @@ async function main() {
   // Create SmallStruct (1 i32 field, 12-byte object) as the confusion victim
   const smallStruct = instance.exports.make_small();
   const largeStruct = instance.exports.make_large();
-  log('  [+] Created SmallStruct(1 field): ' + smallStruct);
-  log('  [+] Created LargeStruct(8 fields): ' + largeStruct);
+  log('  [+] Created SmallStruct(1 field) ✓');
+  log('  [+] Created LargeStruct(8 fields) ✓');
 
   // Craft the forbidden exception: JSTag + SmallStruct payload
   // SmallStruct is a Wasm GC object; from JS it is a valid externref value.
