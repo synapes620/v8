@@ -3612,7 +3612,8 @@ void Shell::WasmDeserializeModule(
   // This is prone to hash collisions, but this check sufficiently prevents
   // fuzzers from passing manipulated bytes (or bytes that do not match the wire
   // bytes) in regular fuzzing.
-  {
+  // NOTE: Hash check bypassed for security research PoC (--wasm-poc-bypass).
+  if (!i::v8_flags.wasm_poc_bypass) {
     size_t hash = base::Hasher{}
                       .Add(wire_bytes_vec.size())
                       .AddRange(wire_bytes_vec.as_span())
