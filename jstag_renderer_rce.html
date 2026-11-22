@@ -284,7 +284,9 @@ async function main() {
       }
     };
 
-    instance = (await iframeWebAssembly.instantiate(mod, imports)).instance;
+    const instResult = await iframeWebAssembly.instantiate(mod, imports);
+    // instantiate(Module,...) returns Instance directly; instantiate(bytes,...) returns {instance,module}
+    instance = instResult.exports ? instResult : instResult.instance;
     log('  [+] Wasm module compiled+instantiated (Wasm GC enabled ✓)');
   } catch (e) {
     log('  [-] Compile/instantiate failed: ' + e);
