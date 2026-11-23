@@ -9214,6 +9214,21 @@ v8_executable("d8") {
   configs += [ "//build/config/compiler:no_exit_time_destructors" ]
 }
 
+v8_executable("poc_wasm_oob") {
+  sources = [ "samples/poc_wasm_oob.cc" ]
+
+  configs = [
+    ":internal_config_base",
+  ]
+
+  deps = [
+    ":v8",
+    ":v8_libbase",
+    ":v8_libplatform",
+    "//build/win:default_exe_manifest",
+  ]
+}
+
 v8_executable("v8_hello_world") {
   sources = [ "samples/hello-world.cc" ]
 
