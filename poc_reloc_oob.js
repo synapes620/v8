@@ -71,8 +71,10 @@ pos += 1;
 // + uint32 src_pos_size + uint32 inlining_pos_size + uint32 deopt_size
 // + uint32 trap_size + uint32 eh_size + uint8 wasm_kind + uint8 exec_tier
 const hdr_offset = pos;
-pos += 9*4;  // 9 int offsets
-pos += 4;    // tagged_parameter_slots
+// 8 int offsets + tagged_parameter_slots = 9 fields total (each 4 bytes)
+// constant_pool, safepoint, handler, code_comments, jump_table_info,
+// unpadded_binary, stack_slots, ool_spills, raw_tagged_parameter_slots
+pos += 9*4;
 const code_size_off = pos;
 const code_size = u32(blob, pos); pos += 4;
 const reloc_size_off = pos;
