@@ -46,13 +46,13 @@ pos += cmod_len;
 print(`[*] After outer header: pos=${pos}`);
 
 // Inner header (from NativeModuleSerializer::WriteHeader via ReadHeader):
-//   detected_features (StorageType = 4 bytes)
+//   detected_features (StorageType = uint64_t = 8 bytes)
 //   remaining_code_size (size_t = 8 bytes)
 //   well_known_imports (0 entries for no imports)
 const inner_hdr_start = pos;
-const detected_features = u32(blob, pos); pos += 4;
+const detected_features = u64(blob, pos); pos += 8;
 const remaining_code = u64(blob, pos); pos += 8;
-print(`[*] detected_features=0x${detected_features.toString(16)}`);
+print(`[*] detected_features=0x${detected_features.toString(16)}n`);
 print(`[*] remaining_code_size=${remaining_code}`);
 
 // Step 3: parse ReadCode for function 0
