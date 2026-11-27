@@ -5269,7 +5269,10 @@ void MacroAssembler::CheckMarkBit(Register object, Register scratch0,
   movl(scratch0, Operand(scratch0, MemoryChunk::MetadataIndexOffset()));
   andl(scratch0,
        Immediate(MemoryChunkConstants::kMetadataPointerTableSizeMask));
-  shll(scratch0, Immediate(kSystemPointerSizeLog2));
+  // sizeof(BasePageTableEntry) == 2*kSystemPointerSize (isolate-group.h:106),
+  // so the byte offset is index << (kSystemPointerSizeLog2 + 1), matching
+  // CodeStubAssembler::BasePageFromMemoryChunk (code-stub-assembler.cc:15088).
+  shll(scratch0, Immediate(kSystemPointerSizeLog2 + 1));
   LoadAddress(scratch1,
               ExternalReference::memory_chunk_metadata_table_address());
   movq(scratch0, Operand(scratch1, scratch0, times_1, 0));
