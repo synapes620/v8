@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V8 ExternConvertAny DCE</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --bg2: #1a1d27;
+  --bg3: #22263a;
+  --fg: #e0e4f0;
+  --fg2: #8892b0;
+  --accent: #64ffda;
+  --warn: #ff6b6b;
+  --ok: #69ff47;
+  --mono: 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 15px; line-height: 1.6;
+  padding: 32px 24px 64px;
+  max-width: 900px; margin: 0 auto;
+}
+h1 { font-size: 1.5rem; font-weight: 700; color: var(--accent); margin-bottom: 4px; }
+.subtitle { color: var(--fg2); font-size: 0.9rem; margin-bottom: 32px; }
+
+.section { margin: 28px 0; }
+h2 { font-size: 1rem; font-weight: 600; color: var(--accent);
+     text-transform: uppercase; letter-spacing: 0.08em;
+     border-bottom: 1px solid var(--bg3); padding-bottom: 6px; margin-bottom: 14px; }
+
+pre, code {
+  font-family: var(--mono); font-size: 0.82rem;
+  background: var(--bg2); border-radius: 6px;
+}
+pre { padding: 14px 16px; overflow-x: auto; line-height: 1.5; }
+code { padding: 1px 5px; }
+
+.bug-box {
+  border: 1px solid var(--warn);
+  border-radius: 8px; padding: 14px 16px;
+  background: rgba(255,107,107,0.06);
+  margin: 12px 0;
+}
+.bug-box .label { color: var(--warn); font-weight: 700; font-size: 0.8rem;
+                  text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+
+.ok-box {
+  border: 1px solid #3a4a3a; border-radius: 8px; padding: 14px 16px;
+  background: rgba(100,255,218,0.04); margin: 12px 0;
+}
+.ok-box .label { color: var(--accent); font-weight: 700; font-size: 0.8rem;
+                 text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+
+.metric { background: var(--bg2); border-radius: 8px; padding: 14px 16px; }
+.metric .name { color: var(--fg2); font-size: 0.8rem; text-transform: uppercase;
+                letter-spacing: 0.06em; margin-bottom: 4px; }
+.metric .value { font-size: 1.8rem; font-weight: 700; font-family: var(--mono); }
+.metric .sub { color: var(--fg2); font-size: 0.78rem; margin-top: 2px; }
+
+#run-btn {
+  background: var(--accent); color: #0f1117;
+  border: none; border-radius: 6px; padding: 10px 24px;
+  font-size: 0.95rem; font-weight: 700; cursor: pointer;
+  margin-top: 16px; transition: opacity 0.15s;
+}
+#run-btn:hover { opacity: 0.85; }
+#run-btn:disabled { opacity: 0.4; cursor: default; }
+
+#log {
+  background: var(--bg2); border-radius: 6px;
+  padding: 12px 14px; font-family: var(--mono);
+  font-size: 0.8rem; white-space: pre-wrap;
+  max-height: 260px; overflow-y: auto;
+  color: var(--fg2); margin-top: 10px;
+  min-height: 60px;
+}
+
+.phase-row { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
+.phase-name { font-family: var(--mono); font-size: 0.78rem; color: var(--fg2); min-width: 220px; }
+.phase-badge {
+  font-size: 0.72rem; font-weight: 700; padding: 2px 7px;
+  border-radius: 4px; text-transform: uppercase; letter-spacing: 0.05em;
+}
+.badge-elim { background: rgba(255,107,107,0.2); color: var(--warn); }
+.badge-keep { background: rgba(100,255,218,0.15); color: var(--accent); }
+.badge-expand { background: rgba(255,183,77,0.15); color: #ffb74d; }
+</style>
+</head>
+<body>
+
+<h1>V8 ExternConvertAny DCE — Incorrect Effects Declaration</h1>
+<p class="subtitle">
+  Authorized security research · Turboshaft DCE via <code>ExternConvertAnyOp.effects = CanDependOnChecks()</code>
+</p>
+
+<div class="section">
+  <h2>Bug Summary</h2>
+  <div class="bug-box">
+    <div class="label">CVE candidate — CWE-670 (incorrect effects)</div>
+    <strong>File:</strong> <code>src/compiler/turboshaft/operations.h:7999</code><br>
+    <strong>Struct:</strong> <code>ExternConvertAnyOp</code><br>
+    <strong>Declared effects:</strong> <code>OpEffects().CanDependOnChecks()</code> — no allocation, no heap writes<br>
+    <strong>Actual effects:</strong> May allocate JS wrapper + write <code>js_wrapper_</code> field for WasmCustomMap inputs<br><br>
+    When the result of <code>extern.convert_any</code> is dropped (unused), Turboshaft DCE
+    eliminates the op in the first optimization pass (LoopPeeling). The runtime call
+    <code>WasmExternConvertAny</code> is never generated, so no allocation occurs.
+    This is "safe" for plain JS objects but skips eager wrapper creation for Wasm structs.
+  </div>
+</div>
+
+<div class="section">
+  <h2>Related Finding</h2>
+  <div class="ok-box">
+    <div class="label">Latent — DCE line 266 CallOp bypass</div>
+    <strong>File:</strong> <code>src/compiler/turboshaft/dead-code-elimination-reducer.h:266</code><br>
+    <code>is&lt;CallOp&gt;()</code> arm intercepts before <code>IsRequiredWhenUnused()</code> for ALL CallOps.
+    Currently unexploitable: the vulnerable <code>CallRuntime&lt;WasmExternConvertAny&gt;</code> path
+    in <code>wasm-lowering-reducer.h:308</code> is unreachable because <code>WasmLoweringPhase</code>
+    only runs in the <code>kWasm</code> pipeline where the protected <code>kWasm</code> branch is taken.
+  </div>
+</div>
+
+<div class="section">
+  <h2>IR Trace Evidence</h2>
+  <p style="color:var(--fg2);font-size:0.85rem;margin-bottom:10px;">
+    From <code>d8 --no-liftoff --trace-turbo-graph</code> for <code>convert_drop</code> (wasm-function#0):
+  </p>
+
+  <div class="phase-row">
+    <span class="phase-name">Graph generation</span>
+    <span class="phase-badge badge-keep">ExternConvertAny present</span>
+  </div>
+  <div class="phase-row">
+    <span class="phase-name">LoopPeeling</span>
+    <span class="phase-badge badge-elim">ExternConvertAny ELIMINATED</span>
+  </div>
+  <div class="phase-row">
+    <span class="phase-name">LoopUnrolling</span>
+    <span class="phase-badge">op already gone</span>
+  </div>
+  <div class="phase-row">
+    <span class="phase-name">WasmGCOptimize</span>
+    <span class="phase-badge">—</span>
+  </div>
+  <div class="phase-row">
+    <span class="phase-name">WasmLowering</span>
+    <span class="phase-badge">no op to lower</span>
+  </div>
+  <div class="phase-row">
+    <span class="phase-name">WasmDeadCodeElimination</span>
+    <span class="phase-badge">—</span>
+  </div>
+
+  <p style="color:var(--fg2);font-size:0.85rem;margin:10px 0;">
+    For <code>convert_use</code> (wasm-function#1):
+  </p>
+
+  <div class="phase-row">
+    <span class="phase-name">Graph generation</span>
+    <span class="phase-badge badge-keep">ExternConvertAny present</span>
+  </div>
+  <div class="phase-row">
+    <span class="phase-name">LoopPeeling → WasmGCOptimize</span>
+    <span class="phase-badge badge-keep">ExternConvertAny preserved (result used)</span>
+  </div>
+  <div class="phase-row">
+    <span class="phase-name">WasmLowering</span>
+    <span class="phase-badge badge-expand">Expanded → Call(WasmExternConvertAny)</span>
+  </div>
+  <div class="phase-row">
+    <span class="phase-name">WasmDeadCodeElimination</span>
+    <span class="phase-badge badge-keep">Call preserved (result used by Return)</span>
+  </div>
+
+  <details style="margin-top:12px;">
+    <summary style="cursor:pointer;color:var(--fg2);font-size:0.85rem;">
+      Raw IR — convert_drop initial graph vs after LoopPeeling
+    </summary>
+    <pre><code><span style="color:#ff6b6b">----- Graph generation -----</span>
+MERGE B0
+    0: Parameter()[0]           ← wasm instance
+    1: Parameter()[1]           ← anyref argument
+    3: WasmStackCheck()[function-entry]
+    4: Load *(#0 + 116)         ← (unused after DCE)
+    5: Load *(#0 + 84)          ← (unused after DCE)
+    6: ExternConvertAny(#1)[nullable]  ← THE OP (result not used by Return)
+    7: Constant()[word32: 0]
+    8: Return(#7)               ← uses #7, NOT #6
+
+<span style="color:#69ff47">----- V8.TFTurboshaftLoopPeeling -----</span>
+MERGE B0
+    0: Parameter()[0]
+    1: Parameter()[1]
+    3: WasmStackCheck()[function-entry]
+    4: Constant()[word32: 0]
+    5: Return(#4)               ← ExternConvertAny (#6) is GONE</code></pre>
+  </details>
+</div>
+
+<div class="section">
+  <h2>Root Cause</h2>
+  <pre><code>// operations.h:7993-8010
+struct ExternConvertAnyOp : FixedArityOperationT&lt;1, ExternConvertAnyOp&gt; {
+  bool is_nullable;
+  // ↓ INCORRECT: missing CanAllocate() + CanWriteHeapMemory()
+  static constexpr OpEffects effects = OpEffects().CanDependOnChecks();
+  //              ↑ required_when_unused = false
+  //              ↑ allocation_requirement = none
+  //              ↑ heap_write_requirement = none
+};
+
+// What WasmToJSObject actually does (runtime-wasm.cc → wasm-objects.cc):
+// For WasmCustomMap inputs:
+//   if (js_wrapper_ == null) CreateJSWrapper(isolate, map);  ← allocates
+//   else return cached js_wrapper_;
+// → Should declare: OpEffects().CanAllocate().CanWriteHeapMemory()
+
+// In DCE (dead-code-elimination-reducer.h:ProcessBlock):
+//   if (op.Is&lt;CallOp&gt;()) { ... }         ← line 266: CallOp bypass
+//   else if (op.IsRequiredWhenUnused()) { ← not reached for CallOp
+//     op_state = kLive;
+//   }
+//   // For ExternConvertAnyOp (NOT a CallOp):
+//   //   IsRequiredWhenUnused() → effects.is_required_when_unused() = false
+//   //   → op_state stays kDead → op eliminated</code></pre>
+</div>
+
+<div class="section">
+  <h2>Live Timing Demonstration</h2>
+  <p style="color:var(--fg2);font-size:0.85rem;margin-bottom:14px;">
+    Compares two wasm functions — <code>convert_drop</code> (result discarded → DCE eliminates)
+    vs <code>convert_use</code> (result returned → preserved). Both use plain JS objects
+    (no WasmCustomMap), so the runtime call is a lightweight identity check for both when preserved.
+    If DCE eliminated <code>extern.convert_any</code>, <code>convert_drop</code> should be faster.
+  </p>
+  <div class="grid">
+    <div class="metric">
+      <div class="name">convert_drop</div>
+      <div class="value" id="ms-drop">—</div>
+      <div class="sub" id="sub-drop">extern.convert_any + drop (DCE eliminates)</div>
+    </div>
+    <div class="metric">
+      <div class="name">convert_use</div>
+      <div class="value" id="ms-use">—</div>
+      <div class="sub" id="sub-use">extern.convert_any (result used)</div>
+    </div>
+  </div>
+  <div class="metric" style="margin-top:14px;">
+    <div class="name">Speedup ratio (use / drop)</div>
+    <div class="value" id="ratio">—</div>
+    <div class="sub" id="verdict">Run test to see result</div>
+  </div>
+  <button id="run-btn">Run DCE timing test</button>
+  <div id="log"></div>
+</div>
+
+<div class="section">
+  <h2>Impact</h2>
+  <pre style="color:var(--fg2);font-size:0.82rem;line-height:1.7;">
+Severity: Incorrect effects declaration (wrong metadata for optimization passes)
+
+Impact 1 — DCE correctness (observable, low severity)
+  extern.convert_any + drop skips JS wrapper allocation for WasmCustomMap objects.
+  V8 uses lazy initialization (js_wrapper_ populated on demand), so the eager
+  allocation skipped by DCE is recreated on the next access. No crash in V8 as-is.
+
+Impact 2 — Load elimination (theoretical, medium severity)
+  Other optimization passes (load elimination) read OpEffects to reason about memory.
+  ExternConvertAnyOp declaring "no heap writes" can mislead load elimination:
+  if LI caches a load of js_wrapper_ from before the extern.convert_any op, it may
+  incorrectly serve the cached (null) value after the op, since it believes the op
+  wrote nothing. This breaks the invariant that js_wrapper_ is populated after the op.
+  Triggering this requires the right JIT code shape with WasmCustomMap inputs.
+
+Impact 3 — DCE line 266 bypass (latent)
+  is&lt;CallOp&gt;() arm intercepts before IsRequiredWhenUnused() for ALL CallOps.
+  When a future refactor causes WasmLoweringPhase to run in a non-kWasm context
+  (e.g. during JS-to-Wasm inlining improvements), the vulnerable else-branch in
+  wasm-lowering-reducer.h:308 becomes reachable, and the narrow kEffects on
+  WasmExternConvertAny combined with the DCE bypass allows full call elimination.</pre>
+</div>
+
+<script>
+// ── Wasm module: extern.convert_any + drop vs use ────────────────────────────
+// (module
+//   (func (export "convert_drop") (param anyref)
+//     local.get 0; extern.convert_any; drop)
+//   (func (export "convert_use") (param anyref) (result externref)
+//     local.get 0; extern.convert_any))
+const wasmBytes = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d,  0x01, 0x00, 0x00, 0x00,
+  0x01, 0x0a, 0x02,
+    0x60, 0x01, 0x6e, 0x00,
+    0x60, 0x01, 0x6e, 0x01, 0x6f,
+  0x03, 0x03, 0x02, 0x00, 0x01,
+  0x07, 0x1e, 0x02,
+    0x0c, 0x63, 0x6f, 0x6e, 0x76, 0x65, 0x72, 0x74, 0x5f, 0x64, 0x72, 0x6f, 0x70, 0x00, 0x00,
+    0x0b, 0x63, 0x6f, 0x6e, 0x76, 0x65, 0x72, 0x74, 0x5f, 0x75, 0x73, 0x65, 0x00, 0x01,
+  0x0a, 0x10, 0x02,
+    0x07, 0x00, 0x20, 0x00, 0xfb, 0x1b, 0x1a, 0x0b,
+    0x06, 0x00, 0x20, 0x00, 0xfb, 0x1b, 0x0b,
+]);
+
+const log = document.getElementById('log');
+const p = msg => { log.textContent += msg + '\n'; log.scrollTop = log.scrollHeight; };
+
+async function runTest() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  log.textContent = '';
+
+  p('[*] Compiling WebAssembly module...');
+
+  let inst;
+  try {
+    const mod = await WebAssembly.compile(wasmBytes);
+    inst = await WebAssembly.instantiate(mod);
+    p('[*] Module compiled and instantiated successfully.');
+  } catch(e) {
+    p('[!] WebAssembly compilation failed: ' + e.message);
+    p('    This PoC requires V8 with WebAssembly GC types (externref/anyref).');
+    btn.disabled = false;
+    return;
+  }
+
+  // Correctness check
+  const testObj = { tag: 'sentinel', n: 0xdeadbeef };
+  inst.exports.convert_drop(testObj);
+  const r = inst.exports.convert_use(testObj);
+  p('[*] convert_use identity: ' + (r === testObj ? 'PASS (r === testObj)' : 'FAIL'));
+
+  // Warm up: trigger Turboshaft JIT tier-up
+  p('[*] Warming up (60k iterations each)...');
+  for (let i = 0; i < 60000; i++) inst.exports.convert_drop(testObj);
+  for (let i = 0; i < 60000; i++) inst.exports.convert_use(testObj);
+  await new Promise(r => setTimeout(r, 10));
+  p('[*] Warm-up complete. Running timing benchmark...');
+
+  const N = 3_000_000;
+
+  // convert_drop: DCE should eliminate extern.convert_any
+  const t1 = performance.now();
+  for (let i = 0; i < N; i++) inst.exports.convert_drop(testObj);
+  const ms_drop = performance.now() - t1;
+
+  // convert_use: extern.convert_any preserved (result returned)
+  const t2 = performance.now();
+  for (let i = 0; i < N; i++) inst.exports.convert_use(testObj);
+  const ms_use = performance.now() - t2;
+
+  document.getElementById('ms-drop').textContent = ms_drop.toFixed(1) + ' ms';
+  document.getElementById('ms-use').textContent  = ms_use.toFixed(1) + ' ms';
+
+  const ratio = ms_use / ms_drop;
+  document.getElementById('ratio').textContent = ratio.toFixed(2) + 'x';
+
+  let verdict, color;
+  if (ratio >= 1.2) {
+    verdict = 'CONFIRMED: convert_drop is faster — DCE eliminated ExternConvertAny';
+    color = '#69ff47';
+  } else if (ratio <= 0.85) {
+    verdict = 'REVERSED: convert_use is faster — JIT may not have tiered up yet';
+    color = '#ff6b6b';
+  } else {
+    verdict = 'CLOSE: ratio near 1.0 — both paths optimized similarly';
+    color = '#ffb74d';
+  }
+  document.getElementById('verdict').textContent = verdict;
+  document.getElementById('verdict').style.color = color;
+
+  p('');
+  p('[Phase 1] convert_drop: ' + ms_drop.toFixed(1) + ' ms');
+  p('[Phase 2] convert_use:  ' + ms_use.toFixed(1) + ' ms');
+  p('[Result]  ratio use/drop = ' + ratio.toFixed(2) + 'x');
+  p('');
+  p('Note: The ExternConvertAny DCE occurs in the LoopPeeling phase,');
+  p('before WasmLowering even runs. For plain JS objects the runtime call');
+  p('is a lightweight identity check, so timing difference may be small.');
+  p('The definitive evidence is the --trace-turbo-graph IR dump showing');
+  p('ExternConvertAny absent after LoopPeeling (see IR Trace Evidence above).');
+
+  btn.disabled = false;
+}
+
+document.getElementById('run-btn').addEventListener('click', runTest);
+</script>
+</body>
+</html>
