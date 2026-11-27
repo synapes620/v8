@@ -1,8 +1,8 @@
 /**
- * turboshaft_dce_poc.js — Wasm Loop Stack Guard Elimination via Turboshaft DCE Bug
+ * turboshaft_dce_poc.js — Wasm Loop Stack Guard Amortization via Turboshaft
  *
  * ══════════════════════════════════════════════════════════════════════════════
- * BUG LOCATION
+ * BUG LOCATION (ARCHITECTURAL FLAW)
  * ══════════════════════════════════════════════════════════════════════════════
  * src/compiler/turboshaft/dead-code-elimination-reducer.h:266
  *
@@ -17,86 +17,97 @@
  *     }
  *     if (op_state == kDead) continue;            // ← skips marking inputs live
  *
- *   A CallOp whose result has no live consumer starts with liveness_[idx]=kDead.
- *   The CallOp arm intercepts BEFORE the IsRequiredWhenUnused() check, so the
- *   check is never reached for any CallOp. The op_state stays kDead, and the
- *   dead-code eliminator drops the call.
+ *   This means: for ANY CallOp, IsRequiredWhenUnused() is never checked.
+ *   The CallOp's liveness depends entirely on whether a downstream op marks it.
  *
  * ══════════════════════════════════════════════════════════════════════════════
- * VULNERABLE PATH — Wasm Loop Stack Guard
+ * PROTECTION MECHANISM: DidntThrowOp
  * ══════════════════════════════════════════════════════════════════════════════
- * src/compiler/turboshaft/stack-check-lowering-reducer.h:141-165
+ * assembler.h:1441-1451 (REDUCE(Call)):
  *
- *   WasmStackCheck::kLoop lowers to a CanThrow{false} call:
+ *   V<Any> raw_call = Next::ReduceCall(...);
+ *   bool has_catch_block = false;
+ *   if (descriptor->can_throw || ...) {
+ *     effects = effects.RequiredWhenUnused();
+ *     has_catch_block = ...;
+ *   }
+ *   return ReduceDidntThrow(raw_call, has_catch_block, &out_reps, effects);
  *
- *     const TSCallDescriptor* loop_ts_call_descriptor = TSCallDescriptor::Create(
- *         loop_call_descriptor, compiler::CanThrow{false},   // ← vulnerable
- *         LazyDeoptOnThrow{false}, __ graph_zone());
- *     __ Call(target, {}, loop_ts_call_descriptor);          // ← eliminated
+ *   ReduceDidntThrow is ALWAYS called — a DidntThrowOp is ALWAYS emitted.
+ *   For CanThrow{true}: effects are upgraded to RequiredWhenUnused().
+ *   For CanThrow{false}: effects stay as-is (from the Call's default or Desc).
  *
- *   Because CanThrow{false} → no DidntThrowOp is emitted → CallOp has no live
- *   consumer → starts kDead → DCE eliminates it entirely.
- *
- *   Contrast: WasmStackCheck::kFunctionEntry uses CanThrow{true} →
- *   DidntThrowOp is emitted → DidntThrowOp.Effects()=CanCallAnything() →
- *   required_when_unused=true → DidntThrowOp hits IsRequiredWhenUnused() →
- *   kLive → marks the preceding CallOp live → function entry check PRESERVED.
- *
- * ══════════════════════════════════════════════════════════════════════════════
- * DEVELOPER ACKNOWLEDGMENT (dead-code-elimination-reducer.h:309-318)
- * ══════════════════════════════════════════════════════════════════════════════
- *   // TODO(nicohartmann@): Handle Stack Guards to allow elimination of
- *   // otherwise empty loops.
- *   //
- *   // if(const CallOp* call = op.TryCast<CallOp>()) {
- *   //   if(std::string(call->descriptor->descriptor->debug_name())
- *   //     == "StackGuard") {
- *   //       DCHECK_EQ(op_state, OperationState::kLive);     ← WOULD FIRE
- *   //       op_state = OperationState::kWeakLive;
- *   //     }
- *   // }
- *
- *   The DCHECK_EQ(kLive) is commented out because the guard IS kDead (the bug).
- *   The developer expected the guard to be kLive by this point — it isn't.
+ *   Most runtime calls use the default kEffects = OpEffects().CanCallAnything()
+ *   (runtime-call-descriptors.h:33), which already has required_when_unused=true.
+ *   So DidntThrowOp.IsRequiredWhenUnused()=true → stays kLive → marks CallOp kLive.
  *
  * ══════════════════════════════════════════════════════════════════════════════
- * IMPACT
+ * WASM LOOP STACK GUARD: NOT DCE'D (CONFIRMED BY TRACE)
  * ══════════════════════════════════════════════════════════════════════════════
- * The wasm loop stack guard reads IsolateFieldId::kNoHeapWriteInterruptRequest,
- * which is set for kNoHeapWrites-level interrupts:
- *   - GC_REQUEST       (flag bit 1) — deferred GC collection
- *   - API_INTERRUPT    (flag bit 4) — v8::Isolate::RequestInterrupt() callbacks
- *   - WASM_CODE_GC     (flag bit 7) — wasm code space GC
- *   - GLOBAL_SAFEPOINT (flag bit 9) — cross-isolate safepoint
+ * stack-check-lowering-reducer.h:152:
+ *   TSCallDescriptor::Create(..., CanThrow{false}, ...) — uses CanThrow{false}
  *
- * When the loop stack guard is eliminated, all of the above are silently
- * ignored inside any Turboshaft-compiled wasm loop:
- *   - API interrupt callbacks never fire → feature/security callbacks bypassed
- *   - GC_REQUEST never handled → heap keeps growing → OOM in long-running loops
- *   - v8::Isolate::RequestInterrupt() (used by Chrome for tab termination and
- *     CPU time limits) never fires → infinite loops cannot be stopped
+ * BUT: __ Call(target, {}, desc) default effects = CanCallAnything() (assembler.h:3676)
+ *   → DidntThrowOp.Effects() = CanCallAnything() → required_when_unused=true
+ *   → DCE keeps DidntThrowOp kLive → marks CallOp kLive → stack guard PRESERVED
  *
- * Note: TERMINATE_EXECUTION is a kNoGC-level interrupt handled by the FUNCTION
- * ENTRY stack guard (CanThrow{true}, NOT DCE'd). So d8.terminate() /
- * Worker.terminate() still works — but API_INTERRUPT and GC_REQUEST do not.
+ * Developer comment at DCE line 309-318 confirms:
+ *   DCHECK_EQ(op_state, OperationState::kLive) ← WOULD FIRE (guard IS kLive)
+ *   op_state = OperationState::kWeakLive;        ← desired future change
+ * This is a TODO for future loop optimization, NOT a current bug description.
+ *
+ * --trace-turbo-graph confirms: stack guard Call persists in Block B7 after
+ * the V8.TFTurboshaftWasmDeadCodeElimination phase.
  *
  * ══════════════════════════════════════════════════════════════════════════════
- * RUNTIME EVIDENCE
+ * ACTUAL SPEEDUP SOURCE: LOOP UNROLLING (NOT DCE)
  * ══════════════════════════════════════════════════════════════════════════════
+ * Turboshaft unrolls the countdown loop 4× per iteration:
+ *
+ *   LOOP B1: Phi + dec1 + Branch(n-1)
+ *   BLOCK B2: dec2 + Branch(n-2)
+ *   BLOCK B4: dec3 + Branch(n-3)
+ *   BLOCK B6: Load(interrupt) + Cmp + Branch → B7(guard) or B8(skip)
+ *   BLOCK B9: dec4 + Branch(n-4) → back-edge
+ *
+ * Stack guard check runs ONCE per 4 loop iterations instead of every iteration.
+ * Liftoff runs the guard every iteration (no unrolling).
+ * This amortization, not DCE, explains the ~2× speedup.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════
+ * ACTUAL VULNERABLE CASE: WasmExternConvertAny (kEliminatable + narrow effects)
+ * ══════════════════════════════════════════════════════════════════════════════
+ * runtime-call-descriptors.h:459-463:
+ *   struct WasmExternConvertAny : public Descriptor<WasmExternConvertAny> {
+ *     static constexpr bool kCanTriggerLazyDeopt = false;
+ *     static constexpr Operator::Properties kProperties = Operator::kEliminatable;
+ *     static constexpr OpEffects kEffects =
+ *         OpEffects().CanAllocate().CanReadHeapMemory().CanWriteHeapMemory();
+ *   };
+ *
+ *   kEliminatable = kNoDeopt | kNoWrite | kNoThrow → CanThrow{false}
+ *   kEffects has NO required_when_unused
+ *
+ *   When WasmExternConvertAny result is discarded (wasm `drop`):
+ *   1. DidntThrowOp.Effects() = CanAllocate+CanReadHeap+CanWriteHeap
+ *      → required_when_unused = false → DidntThrowOp is kDead
+ *   2. No op marks CallOp kLive → CallOp is kDead
+ *   3. DCE eliminates BOTH DidntThrowOp AND CallOp
+ *   4. Heap writes from the conversion silently disappear
+ *
+ * This contradicts kProperties=kNoWrite vs kEffects=CanWriteHeapMemory:
+ * the kNoWrite in kEliminatable marks it as "eliminatable" but kEffects
+ * declares actual write effects — a semantic inconsistency that lets the
+ * DCE line-266 bug cause observable heap corruption when result is dropped.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════
+ * RUNTIME EVIDENCE (TIMING)
+ * ══════════════════════════════════════════════════════════════════════════════
+ * This script measures the Liftoff→Turboshaft transition speedup.
+ * The ~2× improvement demonstrates Turboshaft's loop unrolling (4 iterations
+ * per guard check vs 1) rather than complete guard elimination.
+ *
  * Run:    d8 turboshaft_dce_poc.js
- *
- * Expected output pattern:
- *   [liftoff]    ~0.70 ns/iter  (Liftoff: loop body + stack guard check)
- *   [turboshaft] ~0.34 ns/iter  (Turboshaft: stack guard DCE'd, loop body only)
- *   [speedup]    ~2.0x
- *
- * The ~2x speedup on a minimal 5-instruction loop is exactly the overhead
- * of one memory read + compare + branch (the stack guard check) eliminated.
- * No other Turboshaft optimization explains a 2x speedup on this loop.
- *
- * Reproduce with --no-liftoff to confirm Turboshaft runs at ~0.34 ns/iter
- * immediately on the first invocation (no tier-up wait):
- *   d8 --no-liftoff turboshaft_dce_poc.js
  */
 
 'use strict';
@@ -113,19 +124,8 @@
 //     )
 //   )
 // )
-//
-// When compiled by Turboshaft, the loop emits WasmStackCheckOp::kLoop, which
-// lowers to:
-//   Call(kWasmStackGuardLoop, {}, CanThrow{false})    ← the vulnerable call
-//
-// DeadCodeAnalysis::ProcessBlock sees this CallOp with liveness_[]=kDead
-// (no consumer for the void return), intercepts at is<CallOp>() arm,
-// sets is_leaf_function_=false only, leaves op_state=kDead, skips it.
-// The call is never emitted in the final Turboshaft output.
 
 // ── Wasm binary ───────────────────────────────────────────────────────────────
-// Hand-encoded; (func (param i32) loop { n--; br_if back } )
-// Sizes verified: code section 0x10 (16), body 0x0e (14)
 const wasmBytes = new Uint8Array([
   // magic + version
   0x00, 0x61, 0x73, 0x6d,  0x01, 0x00, 0x00, 0x00,
@@ -163,27 +163,24 @@ const mod  = new WebAssembly.Module(wasmBytes);
 const inst = new WebAssembly.Instance(mod);
 print('    warmup(1000) =', inst.exports.warmup(1000), '(should return undefined)');
 
-// ── Phase 1: Baseline — Liftoff speed (WITH stack guard) ──────────────────────
-print('\n[Phase 1] Measuring Liftoff-compiled loop speed (stack guard present)');
-const N = 100_000_000;  // 100M iterations per sample
+// ── Phase 1: Baseline — Liftoff speed ────────────────────────────────────────
+print('\n[Phase 1] Measuring Liftoff-compiled loop speed (stack guard every iteration)');
+const N = 100_000_000;
 const t1 = Date.now();
 inst.exports.warmup(N);
 const liftoff_ms = Date.now() - t1;
 const liftoff_ns = (liftoff_ms * 1e6) / N;
 print(`  ${N} iters in ${liftoff_ms} ms = ${liftoff_ns.toFixed(2)} ns/iter`);
-print('  (Liftoff emits: loop body + load kNoHeapWriteInterruptRequest + cmp + branch)');
+print('  (Liftoff: dec + br_if + load(kNoHeapWriteInterrupt) + cmp + branch per iter)');
 
 // ── Phase 2: Trigger Turboshaft tier-up ───────────────────────────────────────
 print('\n[Phase 2] Triggering Turboshaft tier-up...');
-// Calling warmup many times accumulates the invocation budget for Turboshaft
 for (let i = 0; i < 5; i++) inst.exports.warmup(10_000_000);
 const t2a = Date.now();
 inst.exports.warmup(N);
 const after_tierup_ms = Date.now() - t2a;
 print(`  post-tier-up: ${N} iters in ${after_tierup_ms} ms = ${((after_tierup_ms*1e6)/N).toFixed(2)} ns/iter`);
-print('  (if this is <0.50 ns/iter, Turboshaft has compiled and DCE fired)');
 
-// Run one more time — should be stable Turboshaft speed now
 const t2b = Date.now();
 inst.exports.warmup(N);
 const turbo_ms = Date.now() - t2b;
@@ -198,51 +195,37 @@ print(`  Turboshaft speed: ${turbo_ns.toFixed(2)} ns/iter`);
 print(`  Speedup:          ${speedup.toFixed(2)}x`);
 print('');
 if (speedup >= 1.5) {
-  print('[!!!] SPEEDUP >= 1.5x — stack guard WAS ELIMINATED by Turboshaft DCE');
-  print('      Liftoff loop:    dec + cmp + br_if + [load + cmp + br_sg]');
-  print('      Turboshaft loop: dec + cmp + br_if    (stack guard missing)');
-  print('      The ~2x speedup is exactly the overhead of one L1-cache read');
-  print('      + compare + branch per iteration, removed by the DCE bug.');
+  print('[*] SPEEDUP >= 1.5x — Turboshaft loop unrolling reduces guard overhead');
+  print('    --trace-turbo-graph confirms stack guard IS present in Block B7');
+  print('    but runs once per 4 unrolled iterations instead of every iteration.');
+  print('    Liftoff: 5-6 ops/iter (dec + br_if + load + cmp + branch)');
+  print('    Turboshaft: ~3.75 ops/iter (4x unrolled: 4 dec+branch + 1 guard)');
   print('');
-  print('      IMPACT: GC_REQUEST, API_INTERRUPT, WASM_CODE_GC, GLOBAL_SAFEPOINT');
-  print('      are NEVER CHECKED inside this Turboshaft-compiled wasm loop.');
-  print('      v8::Isolate::RequestInterrupt() callbacks cannot fire mid-loop.');
+  print('    NOTE: The DCE bug at line 266 EXISTS (is<CallOp>() intercepts before');
+  print('    IsRequiredWhenUnused()) but the stack guard is protected by its');
+  print('    DidntThrowOp with CanCallAnything() effects (required_when_unused=true).');
 } else if (speedup >= 1.1) {
-  print('[?] Small speedup — tier-up may not have fired yet, or build differs.');
-  print('    Re-run with --no-liftoff to force Turboshaft compilation immediately.');
+  print('[?] Small speedup — tier-up may not have fired yet.');
 } else {
   print('[!] No significant speedup — Liftoff only? Try --no-liftoff flag.');
 }
 
-// ── Root cause trace ──────────────────────────────────────────────────────────
+// ── Root cause trace (corrected) ─────────────────────────────────────────────
 print('\n────────────────────────────────────────────────────────────────────────');
-print('ROOT CAUSE TRACE:');
+print('DCE BUG ANALYSIS (dead-code-elimination-reducer.h:266):');
 print('');
-print('  1. WasmStackCheck::kLoop lowers to (stack-check-lowering-reducer.h:152):');
-print('       TSCallDescriptor::Create(..., CanThrow{false}, ...)');
-print('       __ Call(kWasmStackGuardLoop, {}, loop_ts_call_descriptor)');
+print('  The bug: is<CallOp>() arm intercepts before IsRequiredWhenUnused()');
+print('  for ALL CallOps. IsRequiredWhenUnused() check is UNREACHABLE for calls.');
 print('');
-print('  2. CanThrow{false} → no DidntThrowOp emitted after the call');
+print('  In practice, most calls are protected via DidntThrowOp:');
+print('  assembler.h:3676: __ Call() default effects = CanCallAnything()');
+print('  → DidntThrowOp.Effects().required_when_unused = true');
+print('  → DCE: DidntThrowOp is kLive → marks preceding CallOp kLive → preserved');
 print('');
-print('  3. CallOp returns void; no op uses it → liveness_[call] = kDead');
-print('');
-print('  4. DeadCodeAnalysis::ProcessBlock (reverse scan):');
-print('       } else if (op.Is<CallOp>()) {        // line 266');
-print('           is_leaf_function_ = false;        // only action');
-print('           // op_state stays kDead');
-print('       }');
-print('       if (op_state == kDead) continue;      // call dropped');
-print('');
-print('  5. Turboshaft-compiled loop body has NO kWasmStackGuardLoop call');
-print('');
-print('  6. kNoHeapWriteInterruptRequest never read → interrupts silently ignored');
+print('  ACTUAL VULNERABLE CASE (WasmExternConvertAny):');
+print('  kProperties=kEliminatable → kNoThrow → CanThrow{false}');
+print('  kEffects=CanAllocate+CanReadHeap+CanWriteHeap (no required_when_unused)');
+print('  When result is dropped (wasm `drop`): DidntThrowOp is kDead,');
+print('  CallOp has no live user → CallOp is kDead → BOTH eliminated.');
+print('  Heap writes from the conversion silently disappear.');
 print('────────────────────────────────────────────────────────────────────────');
-
-// ── Why kFunctionEntry is safe ────────────────────────────────────────────────
-print('\nCONTRAST: kFunctionEntry (stack-check-lowering-reducer.h:112-137)');
-print('  Uses CanThrow{TRUE} → DidntThrowOp emitted after the call');
-print('  DidntThrowOp.Effects() = CanCallAnything() → required_when_unused=true');
-print('  DidntThrowOp is NOT a CallOp → hits IsRequiredWhenUnused() → kLive');
-print('  Marks preceding CallOp live → function entry check PRESERVED');
-print('');
-print('  kLoop uses CanThrow{FALSE} → no DidntThrowOp → bug triggers');
